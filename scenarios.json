@@ -1,0 +1,18 @@
+{
+  "": {
+    "opex0": 0.0,
+    "term0": 0,
+    "opexinc0": 3.0,
+    "free0": 0,
+    "park0": 0.0,
+    "ti0": 0.0,
+    "base0": 0.0,
+    "name0": "Option 1",
+    "sqft0": 0,
+    "disc0": 7.0,
+    "inc0": 3.0,
+    "move0": 0.0,
+    "ratio0": 0.0
+  },
+  "Cable": {}
+}
