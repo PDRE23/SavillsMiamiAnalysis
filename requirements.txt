@@ -4,3 +4,4 @@ numpy-financial
 plotly
 fpdf
 Pillow
+pyairtable
