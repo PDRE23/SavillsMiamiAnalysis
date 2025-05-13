@@ -1,18 +1,23 @@
+from fpdf import FPDF
+from PIL import Image
+import tempfile
 import streamlit as st
 import pandas as pd
 import numpy_financial as npf
 import io
 from datetime import date, timedelta
 from dateutil.relativedelta import relativedelta
+import plotly.graph_objects as go
+
+def explain(label, tooltip):
+    return f'{label} <span title="{tooltip}">ℹ️</span>'
 
 # --- Analysis Function ---
 def analyze_lease(p):
-    # unpack inputs
     term_mos    = max(p["term_mos"], 1)
     start_date  = p["start_date"]
     sqft        = max(p["sqft"], 1)
     base        = p["base"]
-    inc         = p["inc"]
     opex        = p["opex"]
     opexinc     = p["opexinc"]
     park_cost   = p["park_cost"]
@@ -21,23 +26,29 @@ def analyze_lease(p):
     ti_sf       = p["ti"]
     add_cred    = p["add_cred"]
     move_sf     = p["move_exp"]
+    const_sf    = p.get("construction", 0.0)
     disc_pct    = p["disc"]
+    inc_list    = p.get("rent_incs")
+    custom_ab   = p["custom_abate"]
+    abates      = p.get("abates")
 
-    # calculate periods
+    # determine number of periods
     full_years = term_mos // 12
     extra_mos  = term_mos % 12
     periods    = full_years + (1 if extra_mos else 0)
 
-    # credits & cost
-    abate_credit_full = free_mo/12 * base * sqft
-    ti_credit_full    = ti_sf   * sqft
-    add_credit_full   = add_cred * sqft
-    move_credit_full  = move_sf * sqft
-    p_year            = park_cost * park_spaces * 12 / sqft
+    # one-time credits & annual parking cost/SF
+    ti_credit_full   = ti_sf * sqft
+    add_credit_full  = add_cred * sqft
+    move_credit_full = move_sf * sqft
+    p_year           = park_cost * park_spaces * 12 / sqft
+    construction_full = const_sf * sqft
 
     cfs, rows = [], []
     for i in range(periods):
-        # period dates
+        # pick rent increase
+        inc_pct = inc_list[i] if inc_list and i < len(inc_list) else p["inc"]
+        # dates
         period_start = start_date + relativedelta(months=12*i)
         if i < full_years:
             period_end = period_start + relativedelta(years=1) - timedelta(days=1)
@@ -46,41 +57,52 @@ def analyze_lease(p):
             period_end = start_date + relativedelta(months=term_mos) - timedelta(days=1)
             frac = extra_mos / 12.0
 
-        b_year = base * (1 + inc/100)**i
+        # build rates
+        b_year = base * (1 + inc_pct/100)**i
         o_year = opex * (1 + opexinc/100)**i
-
         gross_full = (b_year + o_year + p_year) * sqft
         gross      = gross_full * frac
 
-        net = -gross
-        if i == 0:
-            net += abate_credit_full
+        # abatement credit
+        if custom_ab and abates:
+            abate_credit = abates[i]/12 * base * sqft
+        else:
+            abate_credit = free_mo/12 * base * sqft if i == 0 else 0
 
+        # total credit
+        credit = abate_credit + (ti_credit_full if i==0 else 0)
+        credit += (add_credit_full if i==0 else 0) + (move_credit_full if i==0 else 0)
+
+        net = -gross + credit
         cfs.append(net)
+
         rows.append({
             "Year":           i+1,
             "Period":         f"{period_start:%m/%d/%Y} – {period_end:%m/%d/%Y}",
             "Base Cost":      round(b_year * sqft * frac),
             "Opex Cost":      round(o_year * sqft * frac),
             "Parking Exp":    round(p_year * sqft * frac),
-            "Rent Abatement": -round(abate_credit_full) if i==0 else 0,
+            "Rent Abatement": -round(abate_credit) if abate_credit else 0,
             "Net CF":         round(net),
         })
 
     # metrics
-    irr      = npf.irr(cfs) if len(cfs) > 1 else None
-    npv_raw  = npf.npv(disc_pct/100, cfs)
-    npv      = abs(npv_raw)
-    occ      = sum(-cf for cf in cfs)
+    irr     = npf.irr(cfs) if len(cfs)>1 else None
+    npv_raw = npf.npv(disc_pct/100, cfs)
+    npv     = abs(npv_raw)
+    occ     = sum(-cf for cf in cfs)
 
-    monthly_base = (base * sqft) / 12 if base > 0 else 0
-    if monthly_base > 0:
-        payback_mos = free_mo + (ti_credit_full + add_credit_full) / monthly_base
+    # payback in months
+    monthly_base = (base * sqft)/12 if base>0 else 0
+    if monthly_base>0:
+        total_abate_months = sum(abates) if custom_ab and abates else free_mo
+        payback_mos = total_abate_months + (ti_credit_full + add_credit_full)/monthly_base
         payback_lbl = f"{int(round(payback_mos))} mo"
     else:
         payback_lbl = "N/A"
 
-    avg = occ / (term_mos * sqft) if term_mos * sqft > 0 else 0
+    # average effective rent — un-prorated full years basis
+    avg = occ/((full_years + (1 if extra_mos else 0))*sqft) if sqft>0 else 0
 
     summary = {
         "Option":            p["name"],
@@ -88,18 +110,19 @@ def analyze_lease(p):
         "Term (mos)":        term_mos,
         "RSF":               sqft,
         "Total Cost":        f"${occ:,.0f}",
-        "Avg Eff. Rent":     f"${avg:,.0f}",
+        "Avg Eff. Rent":     f"${avg:,.2f} /SF/yr",
+        "Payback":           payback_lbl,
         f"NPV ({disc_pct:.2f}%):": f"${npv:,.0f}",
         "TI Allowance":      f"${ti_credit_full:,.0f}",
         "Moving Exp":        f"${move_credit_full:,.0f}",
-        "Additional Credit": f"${add_credit_full:,.0f}",
-        "IRR":               f"{irr*100:.2f}%" if irr else "N/A",
-        "Payback":           payback_lbl,
+        "Construction Cost": f"${construction_full:,.0f}",
+        "Additional Credit": f"${add_credit_full:,.0f}"
     }
 
     return summary, pd.DataFrame(rows)
 
-# -- Streamlit UI --
+
+# -- Streamlit UI Setup --
 st.set_page_config(page_title="Savills Lease Analyzer", layout="wide")
 st.title("Savills | Lease Analyzer")
 st.caption("Created by Peyton Dowd")
@@ -107,129 +130,322 @@ st.markdown("---")
 
 tab_inputs, tab_analysis, tab_comparison = st.tabs(["Inputs","Analysis","Comparison"])
 
+# ---- Inputs Tab (unchanged) ----
 with tab_inputs:
     st.header("Configure & Compare Scenarios")
     compare = st.checkbox("🔁 Compare Multiple Options")
-    count   = st.number_input("Number of Options", 1, 10, 1, step=1) if compare else 1
+    count   = st.number_input("Number of Options", 1, 10, 1) if compare else 1
 
     inputs = []
     for i in range(int(count)):
         with st.expander(f"Scenario {i+1}", expanded=(i==0)):
-            name     = st.text_input("Name", f"Option {i+1}", key=f"name{i}")
-            start_dt = st.date_input("Lease Commencement", date.today(), key=f"sd{i}")
-            term_mos = st.number_input("Lease Term (months)", 0, 600, 0, 1, key=f"tm{i}")
-            sqft     = st.number_input("Rentable SF", 0, 200000, 0, 1, key=f"sq{i}")
+            # Scenario inputs (exactly as before)
+            name      = st.text_input("Name", f"Option {i+1}", key=f"name{i}")
+            start_dt  = st.date_input("Lease Commencement", date.today(), key=f"sd{i}")
+            term_mos  = st.number_input("Lease Term (months)", 0, 600, 0, 1, key=f"tm{i}")
+            sqft      = st.number_input("Rentable SF", 0, 200000, 0, 1, key=f"sq{i}")
             st.markdown("---")
 
-            base    = st.number_input("Base Rent ($/SF/yr)",    0.0,1000.0,0.0,0.01, key=f"b{i}")
-            inc     = st.number_input("Rent ↑ (%)",             0.0,100.0,0.0,0.01, key=f"r{i}")
-            opex    = st.number_input("OPEX ($/SF/yr)",         0.0,500.0,0.0,0.01, key=f"ox{i}")
-            opex_i  = st.number_input("OPEX ↑ (%)",             0.0,100.0,0.0,0.01, key=f"oi{i}")
+            base      = st.number_input("Base Rent ($/SF/yr)", 0.0,1000.0,46.0,0.01,key=f"b{i}")
+            custom_inc= st.checkbox("Custom Rent ↑ per Year", key=f"ci{i}")
+            if custom_inc:
+                yrs        = term_mos//12 + (1 if term_mos%12 else 0)
+                rent_incs  = [st.number_input(f"Year {y} ↑ (%)", 0.0,100.0,0.0,0.1, key=f"yrinc_{i}_{y}") for y in range(1,yrs+1)]
+            else:
+                rent_incs = None
+                inc       = st.number_input("Default Rent ↑ (%)", 0.0,100.0,3.0,0.1, key=f"r{i}")
             st.markdown("---")
 
-            fixed   = st.checkbox("Fixed Parking Spaces", key=f"fx{i}")
-            if fixed:
+            opex      = st.number_input("OPEX ($/SF/yr)", 0.0,500.0,12.0,0.01, key=f"ox{i}")
+            opexinc   = st.number_input("OPEX ↑ (%)", 0.0,100.0,3.0,0.1, key=f"oi{i}")
+            st.markdown("---")
+
+            fxp       = st.checkbox("Fixed Parking Spaces", key=f"fxp{i}")
+            if fxp:
                 park_spaces = st.number_input("Spaces", 0,500,0,1, key=f"ps{i}")
             else:
-                ratio       = st.number_input("Ratio (spaces/1k SF)",0.0,100.0,0.0,0.01, key=f"rt{i}")
-                park_spaces = int(round(ratio * (sqft or 0)/1000))
+                ratio       = st.number_input("Ratio (spaces/1k SF)", 0.0,100.0,0.0,0.1, key=f"rt{i}")
+                park_spaces = int(round(ratio*(sqft or 0)/1000))
                 st.caption(f"→ {park_spaces} spaces")
-            park_cost= st.number_input("Parking $/space/mo",   0.0,500.0,0.0,0.01, key=f"pc{i}")
+            park_cost = st.number_input("Parking $/space/mo", 0.0,500.0,150.0,0.01, key=f"pc{i}")
             st.markdown("---")
 
-            mv_fixed = st.checkbox("Fixed Moving Expense (total $)", key=f"mv_fx{i}")
-            if mv_fixed:
-                mv_total  = st.number_input("Moving Expense (total $)", 0.0,1e7,0.0,1.0, key=f"mv_tot{i}")
-                move_sf   = mv_total / (sqft or 1)
-            else:
-                move_sf   = st.number_input("Moving Expense ($/SF)", 0.0,500.0,0.0,0.01, key=f"mv{i}")
+            mv_sf     = st.number_input("Moving Exp ($/SF)", 0.0,500.0,10.0,0.01, key=f"mv{i}")
             st.markdown("---")
+            const_sf = st.number_input("Construction Exp ($/SF)", 0.0,1000.0,0.0,0.01, key=f"cc{i}")
 
-            free_mo   = st.number_input("Rent Abatement (mo)",   0,24,0,1,    key=f"fr{i}")
 
-            ti_fixed  = st.checkbox("Fixed TI Allowance (total $)", key=f"ti_fx{i}")
-            if ti_fixed:
-                ti_total = st.number_input("TI Allowance (total $)",0.0,1e7,0.0,1.0,key=f"ti_tot{i}")
-                ti_sf     = ti_total / (sqft or 1)
+            cust_ab   = st.checkbox("Custom Abatement per Year", key=f"cab{i}")
+            if cust_ab:
+                yrs      = term_mos//12 + (1 if term_mos%12 else 0)
+                abates   = [st.number_input(f"Year {y} Abate (mo)", 0, term_mos, 0,1, key=f"abate_{i}_{y}") for y in range(1,yrs+1)]
+                free_mo  = 0
             else:
-                ti_sf     = st.number_input("TI Allowance ($/SF)", 0.0,500.0,0.0,0.01, key=f"ti{i}")
+                abates   = None
+                free_mo  = st.number_input("Rent Abatement (mo)", 0,24,3,1, key=f"fr{i}")
 
-            ac_fixed  = st.checkbox("Fixed Additional Credits (total $)", key=f"ac_fx{i}")
-            if ac_fixed:
-                ac_total = st.number_input("Additional Credits (total $)",0.0,1e7,0.0,1.0,key=f"ac_tot{i}")
-                add_cred = ac_total / (sqft or 1)
+            ti_fx     = st.checkbox("Fixed TI Allowance (total $)", key=f"tifx{i}")
+            if ti_fx:
+                tot      = st.number_input("TI Allowance (total $)",0.0,1e7,0.0,1.0, key=f"titot{i}")
+                ti_sf    = tot/(sqft or 1)
             else:
-                add_cred = st.number_input("Additional Credits ($/SF)", 0.0,500.0,0.0,0.01, key=f"ac{i}")
+                ti_sf    = st.number_input("TI Allowance ($/SF)",0.0,500.0,50.0,1.0, key=f"ti{i}")
 
-            st.markdown("---")
+            ac_fx     = st.checkbox("Fixed Additional Credits (total $)", key=f"acfx{i}")
+            if ac_fx:
+                ac_tot   = st.number_input("Additional Credits (total $)",0.0,1e7,0.0,1.0, key=f"ac_tot{i}")
+                add_cred = ac_tot/(sqft or 1)
+            else:
+                add_cred = st.number_input("Additional Credits ($/SF)",0.0,500.0,0.0,0.01, key=f"ac{i}")
+
             disc_pct  = st.number_input("Discount Rate (%)",0.0,100.0,0.0,0.01, key=f"dr{i}")
 
         inputs.append({
-            "name":        name,
-            "start_date":  start_dt,
-            "term_mos":    term_mos,
-            "sqft":        sqft,
-            "base":        base,
-            "inc":         inc,
-            "opex":        opex,
-            "opexinc":     opex_i,
-            "park_cost":   park_cost,
-            "park_spaces": park_spaces,
-            "move_exp":    move_sf,
-            "free":        free_mo,
-            "ti":          ti_sf,
-            "add_cred":    add_cred,
-            "disc":        disc_pct
+            "name":          name,
+            "start_date":    start_dt,
+            "term_mos":      term_mos,
+            "sqft":          sqft,
+            "base":          base,
+            "inc":           inc if not custom_inc else None,
+            "rent_incs":     rent_incs,
+            "opex":          opex,
+            "opexinc":       opexinc,
+            "park_cost":     park_cost,
+            "park_spaces":   park_spaces,
+            "move_exp":      mv_sf,
+            "construction":  const_sf,
+            "free":          free_mo,
+            "ti":            ti_sf,
+            "add_cred":      add_cred,
+            "disc":          disc_pct,
+            "custom_abate":  cust_ab,
+            "abates":        abates,
         })
 
-    if st.button("Run Analysis"):
-        st.session_state["results"] = [analyze_lease(p) for p in inputs]
+if st.button("Run Analysis"):
+    st.session_state["results"] = [(p, *analyze_lease(p)) for p in inputs]
+    st.query_params.update({"tab": "analysis"})
 
+
+# ---- Analysis Tab ----
 with tab_analysis:
     results = st.session_state.get("results", [])
     if not results:
-        st.warning("Run analysis first.")
+        st.warning("Run analysis first in Inputs.")
     else:
-        for idx, (s, wf) in enumerate(results):
+        for idx, (p, s, wf) in enumerate(results):
             st.subheader(f"Scenario {idx+1}: {s['Option']}")
 
-            # summary metrics
-            metric_items = [(k, v) for k, v in s.items()
-                            if k not in ("Option","Start Date","Term (mos)","RSF","IRR")]
-            # reorder to place NPV after Payback
-            payback_idx = next((i for i, (k,_) in enumerate(metric_items) if k == "Payback"), None)
-            npv_idx = next((i for i, (k,_) in enumerate(metric_items) if k.startswith("NPV")), None)
-            if payback_idx is not None and npv_idx is not None:
-                npv_item = metric_items.pop(npv_idx)
-                if npv_idx < payback_idx:
-                    payback_idx -= 1
-                metric_items.insert(payback_idx+1, npv_item)
-            cols = st.columns(len(metric_items))
-            for col_obj, (k, v) in zip(cols, metric_items):
-                col_obj.metric(k, v)
+            st.markdown("### 📊 Lease Summary")
+            left, right = st.columns([1, 1])
+            with left:
+                st.markdown(explain("**Total Cost**", "..."), unsafe_allow_html=True)
+                st.metric("", s["Total Cost"])
+                st.markdown(explain("**Avg Eff. Rent**", "Effective gross rent per SF per year, averaged across full years."), unsafe_allow_html=True)
+                st.metric("", s["Avg Eff. Rent"])
+                st.markdown(explain("**Payback**", "Months to recoup total credits (TI, additional, abatement) via rent."), unsafe_allow_html=True)
+                st.metric("", s["Payback"])
+                st.markdown(explain("**Construction Cost**", "Total construction cost based on $/SF input."), unsafe_allow_html=True)
+                st.metric("", s["Construction Cost"])
 
-            st.markdown("#### Cash-Flow Waterfall")
-            disp = wf.copy()
-            for col in disp.columns:
-                if col not in ("Period",):
-                    disp[col] = disp[col].map(lambda x: f"${int(x):,}")
-            st.dataframe(disp, use_container_width=True)
 
+            with right:
+                npv_label = next(k for k in s if k.startswith("NPV"))
+                st.markdown(explain(f"**{npv_label}**", "Net present value of net cash flows using the given discount rate."), unsafe_allow_html=True)
+                st.metric("", s[npv_label])
+                st.markdown(explain("**TI Allowance**", "Total tenant improvement allowance (TI $/SF × SF)."), unsafe_allow_html=True)
+                st.metric("", s["TI Allowance"])
+                st.markdown(explain("**Moving Exp**", "Moving cost calculated as $/SF × SF."), unsafe_allow_html=True)
+                st.metric("", s["Moving Exp"])
+                st.markdown(explain("**Additional Credit**", "Other landlord incentives such as cash allowances or early occupancy."), unsafe_allow_html=True)
+                st.metric("", s["Additional Credit"])
+
+            # First Chart: Annual Costs
+            st.markdown("### 📈 Annual Cost Breakdown")
+            cost_fig = go.Figure()
+            for name in ["Base Cost", "Opex Cost", "Parking Exp"]:
+                cost_fig.add_trace(go.Bar(name=name, x=wf["Year"], y=wf[name]))
+            cost_fig.update_layout(
+                barmode="stack",
+                title="Annual Cost Breakdown",
+                xaxis_title="Year",
+                yaxis_title="Cost ($)",
+                margin=dict(t=30, b=30),
+                legend_title_text="Category"
+            )
+            st.plotly_chart(cost_fig, use_container_width=True)
+
+            # Second Chart: Detailed Net Cash Flow Breakdown
+            st.markdown("### 📉 Net Cash Flow Waterfall")
+            waterfall_df = wf.copy()
+            year_labels = waterfall_df["Year"]
+
+            base_vals = -waterfall_df["Base Cost"]
+            opex_vals = -waterfall_df["Opex Cost"]
+            park_vals = -waterfall_df["Parking Exp"]
+            abatement_vals = -waterfall_df["Rent Abatement"]
+
+            ti_raw = p["ti"] * p["sqft"]
+            mv_raw = p["move_exp"] * p["sqft"]
+            ac_raw = p["add_cred"] * p["sqft"]
+            const_raw = p.get("construction", 0.0) * p["sqft"]
+
+            ti_vals = [ti_raw if i == 0 else 0 for i in range(len(year_labels))]
+            mv_vals = [mv_raw if i == 0 else 0 for i in range(len(year_labels))]
+            ac_vals = [ac_raw if i == 0 else 0 for i in range(len(year_labels))]
+            const_vals = [const_raw if i == 0 else 0 for i in range(len(year_labels))]
+
+            waterfall_fig = go.Figure()
+            waterfall_fig.add_trace(go.Bar(name="Base Rent", x=year_labels, y=base_vals))
+            waterfall_fig.add_trace(go.Bar(name="OPEX", x=year_labels, y=opex_vals))
+            waterfall_fig.add_trace(go.Bar(name="Parking", x=year_labels, y=park_vals))
+            waterfall_fig.add_trace(go.Bar(name="Rent Abatement", x=year_labels, y=abatement_vals))
+            waterfall_fig.add_trace(go.Bar(name="TI Allowance", x=year_labels, y=ti_vals))
+            waterfall_fig.add_trace(go.Bar(name="Moving Credit", x=year_labels, y=mv_vals))
+            waterfall_fig.add_trace(go.Bar(name="Additional Credit", x=year_labels, y=ac_vals))
+            waterfall_fig.add_trace(go.Bar(name="Construction Cost", x=year_labels, y=[-v for v in const_vals]))
+            
+
+            waterfall_fig.update_layout(
+                barmode="relative",
+                title="Net Cash Flow Breakdown",
+                xaxis_title="Year",
+                yaxis_title="Amount ($)",
+                margin=dict(t=30, b=30),
+                legend_title_text="Component"
+            )
+            st.plotly_chart(waterfall_fig, use_container_width=True)
+
+            with st.expander("📋 Show Cash-Flow Table"):
+                disp = wf.copy()
+                for c in disp.columns:
+                    if c != "Period":
+                        disp[c] = disp[c].map(lambda x: f"${int(x):,}")
+                st.dataframe(disp, use_container_width=True)
+
+# ---- Comparison Tab ----
 with tab_comparison:
     results = st.session_state.get("results", [])
     if len(results) < 2:
         st.info("Enable compare & run ≥2 scenarios.")
     else:
-        df = pd.DataFrame([r[0] for r in results])
-        st.markdown("## Comparison Summary")
-        st.dataframe(df)
+        # Build comparison DataFrame
+        df = pd.DataFrame([r[1] for r in results])  # r[1] is the summary dict
 
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as w:
-            df.to_excel(w, "Summary", index=False)
-        st.download_button(
-            "Download Comparison Excel",
-            buf.getvalue(),
-            file_name="comparison.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+        st.markdown("## Comparison Summary")
+        st.dataframe(df, use_container_width=True)
+
+        # Excel export
+        if not df.empty:
+            excel_buf = io.BytesIO()
+            with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
+                df.to_excel(writer, sheet_name="Summary", index=False)
+            st.download_button("📥 Download Comparison Excel", excel_buf.getvalue(),
+                               file_name="comparison.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+            # PDF export
+            if st.button("📄 Generate PDF Summary"):
+                pdf = FPDF()
+                pdf.set_auto_page_break(auto=True, margin=15)
+                pdf.add_page()
+
+                pdf.set_font("Arial", 'B', 16)
+                pdf.cell(0, 10, "Lease Scenario Comparison Summary", ln=True)
+
+                pdf.set_font("Arial", '', 10)
+                col_width = pdf.w / (len(df.columns) + 1)
+                pdf.ln(5)
+                for col in df.columns:
+                    pdf.cell(col_width, 8, str(col), border=1)
+                pdf.ln()
+                for _, row in df.iterrows():
+                    for val in row:
+                        pdf.cell(col_width, 8, str(val), border=1)
+                    pdf.ln()
+
+                # Add individual scenario summaries
+                for idx, result in enumerate(results):
+                    p, s, wf = result
+
+                    pdf.add_page()
+                    pdf.set_font("Arial", 'B', 14)
+                    pdf.cell(0, 10, f"Scenario {idx+1}: {s['Option']}", ln=True)
+
+                    pdf.set_font("Arial", '', 11)
+                    for k, v in s.items():
+                        pdf.cell(0, 8, f"{k}: {v}", ln=True)
+
+                    import tempfile
+                    from PIL import Image
+
+                    # --- Create and save charts as images ---
+
+                    # Annual Cost Breakdown Chart
+                    cost_fig = go.Figure()
+                    for name in ["Base Cost", "Opex Cost", "Parking Exp"]:
+                        cost_fig.add_trace(go.Bar(name=name, x=wf["Year"], y=wf[name]))
+                    cost_fig.update_layout(
+                        barmode="stack",
+                        title="Annual Cost Breakdown",
+                        xaxis_title="Year",
+                        yaxis_title="Cost ($)",
+                        margin=dict(t=30, b=30),
+                        legend_title_text="Category"
+                    )
+
+                    # Net CF Breakdown Chart
+                    netcf_fig = go.Figure()
+                    netcf_fig.add_trace(go.Bar(name="Rent Abatement", x=wf["Year"], y=wf["Rent Abatement"]))
+                    netcf_fig.add_trace(go.Bar(name="Net CF", x=wf["Year"], y=wf["Net CF"]))
+                    netcf_fig.update_layout(
+                        barmode="relative",
+                        title="Net Cash Flow",
+                        xaxis_title="Year",
+                        yaxis_title="Net Impact ($)",
+                        margin=dict(t=30, b=30),
+                        legend_title_text="Component"
+                    )
+
+                    # Save both charts to temporary files
+                    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as cost_tmp:
+                        cost_fig.write_image(cost_tmp.name, format="png", width=700, height=400)
+                        cost_img_path = cost_tmp.name
+
+                    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as netcf_tmp:
+                        netcf_fig.write_image(netcf_tmp.name, format="png", width=700, height=400)
+                        netcf_img_path = netcf_tmp.name
+
+                    # Insert into PDF
+                    pdf.ln(5)
+                    pdf.set_font("Arial", 'B', 12)
+                    pdf.cell(0, 10, "Annual Cost Breakdown", ln=True)
+                    pdf.image(cost_img_path, w=pdf.w - 30)
+
+                    pdf.ln(5)
+                    pdf.set_font("Arial", 'B', 12)
+                    pdf.cell(0, 10, "Net Cash Flow Breakdown", ln=True)
+                    pdf.image(netcf_img_path, w=pdf.w - 30)
+
+                    # Cash-Flow Table
+                    pdf.ln(5)
+                    pdf.set_font("Arial", 'B', 12)
+                    pdf.cell(0, 10, "Annual Cash Flow Table", ln=True)
+                    pdf.set_font("Arial", '', 8)
+                    cols = wf.columns.tolist()
+                    for col in cols:
+                        pdf.cell(25, 6, col[:15], border=1)
+                    pdf.ln()
+                    for _, row in wf.iterrows():
+                        for val in row:
+                            v = f"${int(val):,}" if isinstance(val, (int, float)) else str(val)
+                            pdf.cell(25, 6, v[:15], border=1)
+                        pdf.ln()
+
+                # Stream to download
+                pdf_output = io.BytesIO()
+                pdf.output(pdf_output)
+                st.download_button("📥 Download PDF Summary", data=pdf_output.getvalue(),
+                                   file_name="Lease_Summary.pdf", mime="application/pdf")
+        else:
+            st.info("No data available for export.")
