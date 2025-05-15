@@ -8,6 +8,7 @@ import io
 from datetime import date, timedelta
 from dateutil.relativedelta import relativedelta
 import plotly.graph_objects as go
+from PIL import Image
 
 def explain(label, tooltip):
     return f'{label} <span title="{tooltip}">ℹ️</span>'
@@ -18,6 +19,8 @@ def analyze_lease(p):
     start_date  = p["start_date"]
     sqft        = max(p["sqft"], 1)
     base        = p["base"]
+    lease_type = p.get("lease_type", "Triple Net (NNN)")
+    opex_base = p.get("opex_base", 0.0)
     opex        = p["opex"]
     opexinc     = p["opexinc"]
     park_cost   = p["park_cost"]
@@ -59,9 +62,17 @@ def analyze_lease(p):
 
         # build rates
         b_year = base * (1 + inc_pct/100)**i
-        o_year = opex * (1 + opexinc/100)**i
+        raw_opex = opex * (1 + opexinc / 100) ** i
+
+        if lease_type == "Full Service (Gross)":
+            base = opex_base or opex
+            o_year = max(0, raw_opex - base)  # tenant pays only the increase
+        else:
+            o_year = raw_opex  # NNN tenant pays full OPEX
+
         gross_full = (b_year + o_year + p_year) * sqft
         gross      = gross_full * frac
+        move_exp   = move_sf * sqft if i == 0 else 0
 
         # abatement credit
         if custom_ab and abates:
@@ -69,34 +80,35 @@ def analyze_lease(p):
         else:
             abate_credit = free_mo/12 * base * sqft if i == 0 else 0
 
-        # total credit
-        credit = abate_credit + (ti_credit_full if i==0 else 0)
-        credit += (add_credit_full if i==0 else 0) + (move_credit_full if i==0 else 0)
+        # total credit (only abatement and additional credit)
+        total_credit = abate_credit + (add_credit_full if i==0 else 0)
 
-        net = -gross + credit
-        cfs.append(net)
+        # Net Rent calculation (as requested)
+        net_rent = gross + move_exp - total_credit
 
         rows.append({
             "Year":           i+1,
             "Period":         f"{period_start:%m/%d/%Y} – {period_end:%m/%d/%Y}",
-            "Base Cost":      round(b_year * sqft * frac),
-            "Opex Cost":      round(o_year * sqft * frac),
+            "Base Rent":      round(b_year * sqft * frac),
+            "Opex":           round(o_year * sqft * frac),
             "Parking Exp":    round(p_year * sqft * frac),
+            "Moving Expense": round(move_exp),
             "Rent Abatement": -round(abate_credit) if abate_credit else 0,
-            "Net CF":         round(net),
+            "Additional Credit": -round(add_credit_full) if i==0 else 0,
+            "Net Rent":       round(abs(net_rent)),
         })
+        cfs.append(-gross + abate_credit + ti_credit_full + add_credit_full + move_credit_full if i==0 else -gross + abate_credit)
 
     # metrics
-    irr     = npf.irr(cfs) if len(cfs)>1 else None
     npv_raw = npf.npv(disc_pct/100, cfs)
     npv     = abs(npv_raw)
-    occ     = sum(-cf for cf in cfs)
+    occ     = sum(row["Net Rent"] for row in rows)
 
     # payback in months
     monthly_base = (base * sqft)/12 if base>0 else 0
     if monthly_base>0:
         total_abate_months = sum(abates) if custom_ab and abates else free_mo
-        payback_mos = total_abate_months + (ti_credit_full + add_credit_full)/monthly_base
+        payback_mos = total_abate_months + (ti_credit_full)/monthly_base
         payback_lbl = f"{int(round(payback_mos))} mo"
     else:
         payback_lbl = "N/A"
@@ -119,112 +131,262 @@ def analyze_lease(p):
         "Additional Credit": f"${add_credit_full:,.0f}"
     }
 
+    # Set Total Cost to sum of Net Rent
+    if 'Net Rent' in rows:
+        total_cost = sum(abs(net_rent) for net_rent in cfs)
+        summary['Total Cost'] = f"${total_cost:,.0f}"
+
     return summary, pd.DataFrame(rows)
 
 
 # -- Streamlit UI Setup --
 st.set_page_config(page_title="Savills Lease Analyzer", layout="wide")
-st.title("Savills | Lease Analyzer")
+
+# Initialize session state for saved scenarios if not exists
+if 'saved_scenarios' not in st.session_state:
+    st.session_state.saved_scenarios = {}
+
+# Global styling
+st.markdown("""
+    <style>
+    .header-container {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        width: 100%;
+    }
+    .logo-container {
+        text-align: right;
+    }
+    .save-load-container {
+        background-color: #f0f2f6;
+        padding: 1.5rem;
+        border-radius: 0.5rem;
+        margin: 1rem 0;
+        border: 1px solid #e0e0e0;
+    }
+    .stButton button {
+        width: 100%;
+        margin-top: 0.5rem;
+        background-color: #0066cc;
+        color: white;
+    }
+    .stButton button:hover {
+        background-color: #0052a3;
+    }
+    div[data-testid="stVerticalBlock"] > div:nth-of-type(1) {
+        padding-top: 1rem;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+# Create header container
+with st.container():
+    col1, col2 = st.columns([0.85, 0.15])
+    with col1:
+        st.title("Savills | Lease Analyzer")
+    with col2:
+        logo = Image.open("savills_logo.png")
+        st.image(logo, width=180)
+
 st.caption("Created by Peyton Dowd")
 st.markdown("---")
 
 tab_inputs, tab_analysis, tab_comparison = st.tabs(["Inputs","Analysis","Comparison"])
 
-# ---- Inputs Tab (unchanged) ----
+# ---- Inputs Tab ----
 with tab_inputs:
     st.header("Configure & Compare Scenarios")
+    
+    # Save/Load Section
+    with st.container():
+        st.markdown('<div class="save-load-container">', unsafe_allow_html=True)
+        
+        save_col, load_col = st.columns([1, 1])
+        
+        with save_col:
+            st.markdown("##### 💾 Save Current Scenario")
+            save_name = st.text_input("Enter name to save scenario", key="save_name")
+            if st.button("Save Scenario", use_container_width=True):
+                if save_name:
+                    # Collect all current inputs
+                    current_scenario = {
+                        "name": st.session_state.get("name0", "Option 1"),
+                        "start_date": st.session_state.get("sd0", date.today()),
+                        "term_mos": st.session_state.get("tm0", 0),
+                        "sqft": st.session_state.get("sq0", 0),
+                        "base": st.session_state.get("b0", 46.0),
+                        "custom_inc": st.session_state.get("ci0", False),
+                        "inc": st.session_state.get("r0", 3.0),
+                        "lease_type": st.session_state.get("lt0", "Triple Net (NNN)"),
+                        "opex": st.session_state.get("ox0", 12.0),
+                        "opexinc": st.session_state.get("oi0", 3.0),
+                        "park_cost": st.session_state.get("pc0", 150.0),
+                        "park_spaces": st.session_state.get("ps0", 0),
+                        "move_exp": st.session_state.get("mv0", 10.0),
+                        "construction": st.session_state.get("cc0", 0.0),
+                        "free": st.session_state.get("fr0", 3),
+                        "ti": st.session_state.get("ti0", 50.0),
+                        "add_cred": st.session_state.get("ac0", 0.0),
+                        "disc": st.session_state.get("dr0", 0.0)
+                    }
+                    st.session_state.saved_scenarios[save_name] = current_scenario
+                    st.success(f"Scenario '{save_name}' saved successfully!")
+                else:
+                    st.warning("Please enter a name for the scenario")
+        
+        with load_col:
+            st.markdown("##### 📂 Load Saved Scenario")
+            if st.session_state.saved_scenarios:
+                scenario_names = list(st.session_state.saved_scenarios.keys())
+                selected_scenario = st.selectbox("Select scenario to load", scenario_names, key="load_scenario")
+                
+                col1, col2 = st.columns([1, 1])
+                with col1:
+                    if st.button("Load", use_container_width=True):
+                        scenario = st.session_state.saved_scenarios[selected_scenario]
+                        # Update all session state variables
+                        for key, value in scenario.items():
+                            st.session_state[key + "0"] = value
+                        st.success(f"Loaded scenario: {selected_scenario}")
+                
+                with col2:
+                    if st.button("Delete", use_container_width=True):
+                        del st.session_state.saved_scenarios[selected_scenario]
+                        st.success(f"Deleted scenario: {selected_scenario}")
+                        st.rerun()
+            else:
+                st.info("No saved scenarios available")
+        
+        st.markdown('</div>', unsafe_allow_html=True)
+    
+    # Main configuration section
+    st.markdown("### Configuration")
     compare = st.checkbox("🔁 Compare Multiple Options")
     count   = st.number_input("Number of Options", 1, 10, 1) if compare else 1
 
     inputs = []
     for i in range(int(count)):
         with st.expander(f"Scenario {i+1}", expanded=(i==0)):
-            # Scenario inputs (exactly as before)
+            # Basic Information
             name      = st.text_input("Name", f"Option {i+1}", key=f"name{i}")
             start_dt  = st.date_input("Lease Commencement", date.today(), key=f"sd{i}")
             term_mos  = st.number_input("Lease Term (months)", 0, 600, 0, 1, key=f"tm{i}")
             sqft      = st.number_input("Rentable SF", 0, 200000, 0, 1, key=f"sq{i}")
             st.markdown("---")
 
-            base      = st.number_input("Base Rent ($/SF/yr)", 0.0,1000.0,46.0,0.01,key=f"b{i}")
-            custom_inc= st.checkbox("Custom Rent ↑ per Year", key=f"ci{i}")
-            if custom_inc:
-                yrs        = term_mos//12 + (1 if term_mos%12 else 0)
-                rent_incs  = [st.number_input(f"Year {y} ↑ (%)", 0.0,100.0,0.0,0.1, key=f"yrinc_{i}_{y}") for y in range(1,yrs+1)]
-            else:
-                rent_incs = None
-                inc       = st.number_input("Default Rent ↑ (%)", 0.0,100.0,3.0,0.1, key=f"r{i}")
+            # Rent and Operating Expenses Section
+            rent_col, opex_col = st.columns(2)
+            
+            with rent_col:
+                st.markdown("#### Base Rent")
+                base = st.number_input("Base Rent ($/SF/yr)", 0.0, 1000.0, 46.0, 0.01, key=f"b{i}")
+                custom_inc = st.checkbox("Custom Rent ↑ per Year", key=f"ci{i}")
+                if custom_inc:
+                    yrs = term_mos//12 + (1 if term_mos%12 else 0)
+                    rent_incs = [st.number_input(f"Year {y} ↑ (%)", 0.0, 100.0, 0.0, 0.1, key=f"yrinc_{i}_{y}") for y in range(1,yrs+1)]
+                else:
+                    rent_incs = None
+                    inc = st.number_input("Default Rent ↑ (%)", 0.0, 100.0, 3.0, 0.1, key=f"r{i}")
+            
+            with opex_col:
+                st.markdown("#### Operating Expenses")
+                lease_type = st.selectbox(
+                    "Lease Type",
+                    ["Full Service (Gross)", "Triple Net (NNN)"],
+                    key=f"lt{i}"
+                )
+
+                if lease_type == "Triple Net (NNN)":
+                    opex = st.number_input("OPEX ($/SF/yr)", 0.0, 500.0, 12.0, 0.01, key=f"ox{i}")
+                    opexinc = st.number_input("OPEX ↑ (%)", 0.0, 100.0, 3.0, 0.1, key=f"oi{i}")
+                    opex_base = None  # NNN pays everything
+                else:
+                    opex = 0.0  # Full Service doesn't pay OPEX
+                    opexinc = 0.0  # No OPEX increase for Full Service
+                    opex_base = None  # No base year for Full Service
+
             st.markdown("---")
 
-            opex      = st.number_input("OPEX ($/SF/yr)", 0.0,500.0,12.0,0.01, key=f"ox{i}")
-            opexinc   = st.number_input("OPEX ↑ (%)", 0.0,100.0,3.0,0.1, key=f"oi{i}")
-            st.markdown("---")
-
-            fxp       = st.checkbox("Fixed Parking Spaces", key=f"fxp{i}")
+            # Parking Section
+            st.markdown("#### Parking")
+            fxp = st.checkbox("Fixed Parking Spaces", key=f"fxp{i}")
             if fxp:
                 park_spaces = st.number_input("Spaces", 0,500,0,1, key=f"ps{i}")
             else:
-                ratio       = st.number_input("Ratio (spaces/1k SF)", 0.0,100.0,0.0,0.1, key=f"rt{i}")
+                ratio = st.number_input("Ratio (spaces/1k SF)", 0.0,100.0,0.0,0.1, key=f"rt{i}")
                 park_spaces = int(round(ratio*(sqft or 0)/1000))
                 st.caption(f"→ {park_spaces} spaces")
             park_cost = st.number_input("Parking $/space/mo", 0.0,500.0,150.0,0.01, key=f"pc{i}")
             st.markdown("---")
 
-            mv_sf     = st.number_input("Moving Exp ($/SF)", 0.0,500.0,10.0,0.01, key=f"mv{i}")
-            st.markdown("---")
+            # Additional Costs Section
+            st.markdown("#### Additional Costs")
+            mv_sf = st.number_input("Moving Exp ($/SF)", 0.0,500.0,10.0,0.01, key=f"mv{i}")
             const_sf = st.number_input("Construction Exp ($/SF)", 0.0,1000.0,0.0,0.01, key=f"cc{i}")
 
-
-            cust_ab   = st.checkbox("Custom Abatement per Year", key=f"cab{i}")
+            # Abatement Section
+            st.markdown("#### Abatement")
+            cust_ab = st.checkbox("Custom Abatement per Year", key=f"cab{i}")
             if cust_ab:
-                yrs      = term_mos//12 + (1 if term_mos%12 else 0)
-                abates   = [st.number_input(f"Year {y} Abate (mo)", 0, term_mos, 0,1, key=f"abate_{i}_{y}") for y in range(1,yrs+1)]
-                free_mo  = 0
+                yrs = term_mos//12 + (1 if term_mos%12 else 0)
+                abates = [st.number_input(f"Year {y} Abate (mo)", 0, term_mos, 0,1, key=f"abate_{i}_{y}") for y in range(1,yrs+1)]
+                free_mo = 0
             else:
-                abates   = None
-                free_mo  = st.number_input("Rent Abatement (mo)", 0,24,3,1, key=f"fr{i}")
+                abates = None
+                free_mo = st.number_input("Rent Abatement (mo)", 0,24,3,1, key=f"fr{i}")
 
-            ti_fx     = st.checkbox("Fixed TI Allowance (total $)", key=f"tifx{i}")
+            # TI Allowance Section
+            st.markdown("#### TI Allowance")
+            ti_fx = st.checkbox("Fixed TI Allowance (total $)", key=f"tifx{i}")
             if ti_fx:
-                tot      = st.number_input("TI Allowance (total $)",0.0,1e7,0.0,1.0, key=f"titot{i}")
-                ti_sf    = tot/(sqft or 1)
+                tot = st.number_input("TI Allowance (total $)",0.0,1e7,0.0,1.0, key=f"titot{i}")
+                ti_sf = tot/(sqft or 1)
             else:
-                ti_sf    = st.number_input("TI Allowance ($/SF)",0.0,500.0,50.0,1.0, key=f"ti{i}")
+                ti_sf = st.number_input("TI Allowance ($/SF)",0.0,500.0,50.0,1.0, key=f"ti{i}")
 
-            ac_fx     = st.checkbox("Fixed Additional Credits (total $)", key=f"acfx{i}")
+            # Additional Credits Section
+            st.markdown("#### Additional Credits")
+            ac_fx = st.checkbox("Fixed Additional Credits (total $)", key=f"acfx{i}")
             if ac_fx:
-                ac_tot   = st.number_input("Additional Credits (total $)",0.0,1e7,0.0,1.0, key=f"ac_tot{i}")
+                ac_tot = st.number_input("Additional Credits (total $)",0.0,1e7,0.0,1.0, key=f"ac_tot{i}")
                 add_cred = ac_tot/(sqft or 1)
             else:
                 add_cred = st.number_input("Additional Credits ($/SF)",0.0,500.0,0.0,0.01, key=f"ac{i}")
 
-            disc_pct  = st.number_input("Discount Rate (%)",0.0,100.0,0.0,0.01, key=f"dr{i}")
+            # Discount Rate
+            st.markdown("#### Financial Parameters")
+            disc_pct = st.number_input("Discount Rate (%)",0.0,100.0,0.0,0.01, key=f"dr{i}")
 
-        inputs.append({
-            "name":          name,
-            "start_date":    start_dt,
-            "term_mos":      term_mos,
-            "sqft":          sqft,
-            "base":          base,
-            "inc":           inc if not custom_inc else None,
-            "rent_incs":     rent_incs,
-            "opex":          opex,
-            "opexinc":       opexinc,
-            "park_cost":     park_cost,
-            "park_spaces":   park_spaces,
-            "move_exp":      mv_sf,
-            "construction":  const_sf,
-            "free":          free_mo,
-            "ti":            ti_sf,
-            "add_cred":      add_cred,
-            "disc":          disc_pct,
-            "custom_abate":  cust_ab,
-            "abates":        abates,
-        })
+            inputs.append({
+                "name":          name,
+                "start_date":    start_dt,
+                "term_mos":      term_mos,
+                "sqft":          sqft,
+                "base":          base,
+                "inc":           inc if not custom_inc else None,
+                "rent_incs":     rent_incs,
+                "lease_type":    lease_type,
+                "opex_base":     opex_base,
+                "opex":          opex,
+                "opexinc":       opexinc,
+                "park_cost":     park_cost,
+                "park_spaces":   park_spaces,
+                "move_exp":      mv_sf,
+                "construction":  const_sf,
+                "free":          free_mo,
+                "ti":            ti_sf,
+                "add_cred":      add_cred,
+                "disc":          disc_pct,
+                "custom_abate":  cust_ab,
+                "abates":        abates,
+            })
 
-if st.button("Run Analysis"):
-    st.session_state["results"] = [(p, *analyze_lease(p)) for p in inputs]
-    st.query_params.update({"tab": "analysis"})
+    st.markdown("<p style='font-size: 0.8em; color: gray;'>© 2025 Savills. All rights reserved.</p>", unsafe_allow_html=True)
+
+    if st.button("Run Analysis"):
+        st.session_state["results"] = [(p, *analyze_lease(p)) for p in inputs]
+        st.query_params.update({"tab": "analysis"})
 
 
 # ---- Analysis Tab ----
@@ -233,37 +395,43 @@ with tab_analysis:
     if not results:
         st.warning("Run analysis first in Inputs.")
     else:
+        # Find the lowest total rent for highlighting
+        total_rents = [float(r[1]["Total Cost"].replace("$", "").replace(",", "")) for r in results]
+        min_total_rent = min(total_rents) if total_rents else None
         for idx, (p, s, wf) in enumerate(results):
             st.subheader(f"Scenario {idx+1}: {s['Option']}")
 
-            st.markdown("### 📊 Lease Summary")
-            left, right = st.columns([1, 1])
-            with left:
-                st.markdown(explain("**Total Cost**", "..."), unsafe_allow_html=True)
-                st.metric("", s["Total Cost"])
-                st.markdown(explain("**Avg Eff. Rent**", "Effective gross rent per SF per year, averaged across full years."), unsafe_allow_html=True)
-                st.metric("", s["Avg Eff. Rent"])
-                st.markdown(explain("**Payback**", "Months to recoup total credits (TI, additional, abatement) via rent."), unsafe_allow_html=True)
-                st.metric("", s["Payback"])
-                st.markdown(explain("**Construction Cost**", "Total construction cost based on $/SF input."), unsafe_allow_html=True)
-                st.metric("", s["Construction Cost"])
+            # Highlight Total Rent: green for lowest, red for others
+            is_lowest = float(s["Total Cost"].replace("$", "").replace(",", "")) == min_total_rent
+            total_rent_color = "#008000" if is_lowest else "#d90429"
+            st.markdown('#### Key Metrics')
+            k1, k2, k3 = st.columns(3)
+            with k1:
+                st.markdown(f'<div style="font-size:1.1em;font-weight:bold;">Total Rent</div>', unsafe_allow_html=True)
+                st.markdown(f'<div style="font-size:1.7em;font-weight:bold;color:{total_rent_color}">{s["Total Cost"]}</div>', unsafe_allow_html=True)
+            k2.metric("Avg Eff. Rent", s["Avg Eff. Rent"], help="Effective gross rent per SF per year, averaged across full years.")
+            k3.metric("Net Present Value", s[next(k for k in s if k.startswith("NPV"))], help="Net present value of net cash flows using the given discount rate.")
 
+            k4, k5, k6 = st.columns(3)
+            k4.metric("Payback", s["Payback"], help="Months to recoup TI allowance and abatement via rent.")
+            k5.metric("Moving Exp", s["Moving Exp"], help="Moving cost calculated as $/SF × SF.")
+            k6.metric("Additional Credit", s["Additional Credit"], help="Other landlord incentives such as cash allowances or early occupancy.")
 
-            with right:
-                npv_label = next(k for k in s if k.startswith("NPV"))
-                st.markdown(explain(f"**{npv_label}**", "Net present value of net cash flows using the given discount rate."), unsafe_allow_html=True)
-                st.metric("", s[npv_label])
-                st.markdown(explain("**TI Allowance**", "Total tenant improvement allowance (TI $/SF × SF)."), unsafe_allow_html=True)
-                st.metric("", s["TI Allowance"])
-                st.markdown(explain("**Moving Exp**", "Moving cost calculated as $/SF × SF."), unsafe_allow_html=True)
-                st.metric("", s["Moving Exp"])
-                st.markdown(explain("**Additional Credit**", "Other landlord incentives such as cash allowances or early occupancy."), unsafe_allow_html=True)
-                st.metric("", s["Additional Credit"])
+            st.markdown('#### Construction')
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Tenant Improvement Allowance", s["TI Allowance"], help="Total tenant improvement allowance (TI $/SF × SF).")
+            c2.metric("Construction Cost", s["Construction Cost"], help="Total construction cost based on $/SF input.")
+            ti_allowance = float(s["TI Allowance"].replace("$", "").replace(",", ""))
+            construction_cost = float(s["Construction Cost"].replace("$", "").replace(",", ""))
+            tenant_expense = construction_cost - ti_allowance
+            c3.metric("Tenant's Construction Expense", f"${tenant_expense:,.0f}", help="Construction Cost minus TI Allowance.")
 
-            # First Chart: Annual Costs
+            st.markdown('---')
+
+            # Annual Cost Breakdown Chart
             st.markdown("### 📈 Annual Cost Breakdown")
             cost_fig = go.Figure()
-            for name in ["Base Cost", "Opex Cost", "Parking Exp"]:
+            for name in ["Base Rent", "Opex", "Parking Exp", "Moving Expense"]:
                 cost_fig.add_trace(go.Bar(name=name, x=wf["Year"], y=wf[name]))
             cost_fig.update_layout(
                 barmode="stack",
@@ -275,53 +443,29 @@ with tab_analysis:
             )
             st.plotly_chart(cost_fig, use_container_width=True)
 
-            # Second Chart: Detailed Net Cash Flow Breakdown
-            st.markdown("### 📉 Net Cash Flow Waterfall")
-            waterfall_df = wf.copy()
-            year_labels = waterfall_df["Year"]
-
-            base_vals = -waterfall_df["Base Cost"]
-            opex_vals = -waterfall_df["Opex Cost"]
-            park_vals = -waterfall_df["Parking Exp"]
-            abatement_vals = -waterfall_df["Rent Abatement"]
-
-            ti_raw = p["ti"] * p["sqft"]
-            mv_raw = p["move_exp"] * p["sqft"]
-            ac_raw = p["add_cred"] * p["sqft"]
-            const_raw = p.get("construction", 0.0) * p["sqft"]
-
-            ti_vals = [ti_raw if i == 0 else 0 for i in range(len(year_labels))]
-            mv_vals = [mv_raw if i == 0 else 0 for i in range(len(year_labels))]
-            ac_vals = [ac_raw if i == 0 else 0 for i in range(len(year_labels))]
-            const_vals = [const_raw if i == 0 else 0 for i in range(len(year_labels))]
-
-            waterfall_fig = go.Figure()
-            waterfall_fig.add_trace(go.Bar(name="Base Rent", x=year_labels, y=base_vals))
-            waterfall_fig.add_trace(go.Bar(name="OPEX", x=year_labels, y=opex_vals))
-            waterfall_fig.add_trace(go.Bar(name="Parking", x=year_labels, y=park_vals))
-            waterfall_fig.add_trace(go.Bar(name="Rent Abatement", x=year_labels, y=abatement_vals))
-            waterfall_fig.add_trace(go.Bar(name="TI Allowance", x=year_labels, y=ti_vals))
-            waterfall_fig.add_trace(go.Bar(name="Moving Credit", x=year_labels, y=mv_vals))
-            waterfall_fig.add_trace(go.Bar(name="Additional Credit", x=year_labels, y=ac_vals))
-            waterfall_fig.add_trace(go.Bar(name="Construction Cost", x=year_labels, y=[-v for v in const_vals]))
-            
-
-            waterfall_fig.update_layout(
-                barmode="relative",
-                title="Net Cash Flow Breakdown",
-                xaxis_title="Year",
-                yaxis_title="Amount ($)",
-                margin=dict(t=30, b=30),
-                legend_title_text="Component"
-            )
-            st.plotly_chart(waterfall_fig, use_container_width=True)
-
-            with st.expander("📋 Show Cash-Flow Table"):
+            # Rent Schedule Table
+            with st.expander("📋 Rent Schedule"):
                 disp = wf.copy()
-                for c in disp.columns:
-                    if c != "Period":
-                        disp[c] = disp[c].map(lambda x: f"${int(x):,}")
-                st.dataframe(disp, use_container_width=True)
+                # Format all numeric columns as currency
+                for col in disp.columns:
+                    if col not in ['Period', 'Year']:
+                        disp[col] = disp[col].map(lambda x: f"${int(x):,}" if isinstance(x, (int, float)) else x)
+                # Ensure Net Rent is positive and formatted as currency
+                if 'Net Rent' in disp.columns:
+                    disp['Net Rent'] = disp['Net Rent'].apply(lambda x: f"${abs(int(str(x).replace('$','').replace(',','').replace('-',''))):,}" if isinstance(x, str) and any(c.isdigit() for c in x) else x)
+                # Styling for yellow highlight, green font, and thick black borders
+                def style_table(row):
+                    styles = [''] * len(row)
+                    if row.name == 'Net Rent':
+                        styles = ['background-color: #ffffcc'] * len(row)
+                    if row.name in ['Rent Abatement', 'Additional Credit']:
+                        styles = ['color: #008000; font-weight: bold;'] * len(row)
+                    if row.name in ['Parking Exp', 'Rent Abatement']:
+                        styles = [s + ';border-bottom: 4px solid #000' for s in styles]
+                    return styles
+                disp = disp.set_index('Year').T
+                st.dataframe(disp.style.apply(style_table, axis=1), use_container_width=True)
+            st.markdown("---")
 
 # ---- Comparison Tab ----
 with tab_comparison:
@@ -329,8 +473,11 @@ with tab_comparison:
     if len(results) < 2:
         st.info("Enable compare & run ≥2 scenarios.")
     else:
-        # Build comparison DataFrame
-        df = pd.DataFrame([r[1] for r in results])  # r[1] is the summary dict
+        # Build comparison DataFrame with Lease Type
+        df = pd.DataFrame([{
+            **r[1],  # summary
+            "Lease Type": r[0].get("lease_type", "")
+        } for r in results])
 
         st.markdown("## Comparison Summary")
         st.dataframe(df, use_container_width=True)
@@ -349,6 +496,9 @@ with tab_comparison:
                 pdf = FPDF()
                 pdf.set_auto_page_break(auto=True, margin=15)
                 pdf.add_page()
+                pdf.image("savills_logo.png", x=10, y=10, w=40)
+                pdf.ln(20)  # space below the logo
+
 
                 pdf.set_font("Arial", 'B', 16)
                 pdf.cell(0, 10, "Lease Scenario Comparison Summary", ln=True)
@@ -369,6 +519,9 @@ with tab_comparison:
                     p, s, wf = result
 
                     pdf.add_page()
+                    pdf.image("savills_logo.png", x=10, y=10, w=40)
+                    pdf.ln(20)  # space below the logo
+
                     pdf.set_font("Arial", 'B', 14)
                     pdf.cell(0, 10, f"Scenario {idx+1}: {s['Option']}", ln=True)
 
@@ -383,7 +536,7 @@ with tab_comparison:
 
                     # Annual Cost Breakdown Chart
                     cost_fig = go.Figure()
-                    for name in ["Base Cost", "Opex Cost", "Parking Exp"]:
+                    for name in ["Base Rent", "Opex", "Parking Exp"]:
                         cost_fig.add_trace(go.Bar(name=name, x=wf["Year"], y=wf[name]))
                     cost_fig.update_layout(
                         barmode="stack",
