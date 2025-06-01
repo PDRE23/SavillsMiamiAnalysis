@@ -1,3 +1,4 @@
+import os
 from fpdf import FPDF
 from PIL import Image
 import tempfile
@@ -9,8 +10,39 @@ import io
 from datetime import date, timedelta
 from dateutil.relativedelta import relativedelta
 import plotly.graph_objects as go
-from PIL import Image
 import streamlit.components.v1 as components
+
+# Set page config first, before any other Streamlit commands
+st.set_page_config(
+    page_title="Savills Lease Analyzer",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Initialize session state
+if 'saved_scenarios' not in st.session_state:
+    st.session_state.saved_scenarios = {}
+if 'count' not in st.session_state:
+    st.session_state.count = 1
+
+# Function to get asset path
+def get_asset_path(filename):
+    try:
+        # Check if running on Streamlit Cloud
+        if os.getenv('STREAMLIT_SHARING') or os.getenv('STREAMLIT_SERVER_URL'):
+            return os.path.join(os.path.dirname(__file__), filename)
+        return filename
+    except Exception:
+        return filename
+
+# Load logo safely
+def load_logo():
+    try:
+        logo_path = get_asset_path("savills_logo.png")
+        return Image.open(logo_path)
+    except Exception as e:
+        return None
 
 def explain(label, tooltip):
     return f'{label} <span title="{tooltip}">ℹ️</span>'
@@ -246,160 +278,6 @@ def analyze_lease(p):
 
 
 # -- Streamlit UI Setup --
-st.set_page_config(page_title="Savills Lease Analyzer", layout="wide")
-
-# Initialize session state for saved scenarios if not exists
-if 'saved_scenarios' not in st.session_state:
-    st.session_state.saved_scenarios = {}
-
-# Initialize count if not exists
-if 'count' not in st.session_state:
-    st.session_state.count = 1
-
-def load_test_data():
-    """Load test data into session state for a single scenario"""
-    st.session_state.count = 1
-    
-    # Calculate parking spaces based on ratio
-    ratio = 4.0  # 4 spaces per 1,000 SF
-    sqft = 10000
-    total_spaces = int(round((ratio * sqft) / 1000))  # 40 spaces for 10,000 SF at 4/1000
-    unres_spaces = int(round(total_spaces * 0.8))  # 80% unreserved
-    res_spaces = total_spaces - unres_spaces  # 20% reserved
-
-    # Update all session state variables
-    for key, value in {
-        "sd0": date.today(),
-        "tm0": 84,  # 7 years
-        "sq0": sqft,
-        "b0": 46.0,
-        "ci0": False,  # Using default 3% increase
-        "r0": 3.0,
-        "lt0": "Triple Net (NNN)",
-        "ox0": 12.0,
-        "oi0": 3.0,
-        "pc0": 150.0,
-        "ps0": total_spaces,
-        "mv0": 5.0,  # Moving expense $5/SF
-        "cc0": 55.0,
-        "fr0": 3,
-        "ti0": 50.0,
-        "ac0": 0.0,
-        "dr0": 5.0,
-        # Parking details
-        "rt_unres0": ratio,  # Parking ratio per 1,000 SF
-        "ps_unres0": unres_spaces,
-        "pc_unres0": 150.0,
-        "ps_res0": res_spaces,
-        "pc_res0": 250.0,
-        # Abatement
-        "cab0": False,
-        # TI and Credits
-        "tifx0": False,
-        "acfx0": False,
-        "mvfx0": False,
-        "ccfx0": False,
-        "inside_term0": False
-    }.items():
-        st.session_state[key] = value
-
-def load_comparison_test_data():
-    """Load test data into session state for two scenarios to compare"""
-    st.session_state.count = 2
-
-    sqft = 10000
-    
-    # First scenario - Higher rent, more TI
-    ratio0 = 3.0  # 3 spaces per 1,000 SF
-    total_spaces0 = int(round((ratio0 * sqft) / 1000))  # 30 spaces
-    unres_spaces0 = int(round(total_spaces0 * 0.8))  # 80% unreserved
-    res_spaces0 = total_spaces0 - unres_spaces0  # 20% reserved
-
-    scenario1 = {
-        "name0": "High Rent + Concessions",
-        "sd0": date.today(),
-        "tm0": 84,  # 7 years
-        "sq0": sqft,
-        "b0": 48.0,  # Higher base rent
-        "ci0": False,  # Using default 3% increase
-        "r0": 3.0,
-        "lt0": "Triple Net (NNN)",
-        "ox0": 12.0,
-        "oi0": 3.0,
-        "pc0": 150.0,
-        "ps0": total_spaces0,
-        "mv0": 5.0,  # Moving expense $5/SF
-        "cc0": 55.0,
-        "fr0": 4,  # More free months
-        "ti0": 60.0,  # Higher TI
-        "ac0": 5.0,  # Additional credit
-        "dr0": 5.0,
-        # Parking details
-        "rt_unres0": ratio0,  # Parking ratio per 1,000 SF
-        "ps_unres0": unres_spaces0,
-        "pc_unres0": 150.0,
-        "ps_res0": res_spaces0,
-        "pc_res0": 250.0,
-        "cab0": False,
-        "tifx0": False,
-        "acfx0": False,
-        "mvfx0": False,
-        "ccfx0": False,
-        "inside_term0": False
-    }
-
-    # Second scenario - Lower rent, less TI
-    ratio1 = 4.0  # 4 spaces per 1,000 SF
-    total_spaces1 = int(round((ratio1 * sqft) / 1000))  # 40 spaces
-    unres_spaces1 = int(round(total_spaces1 * 0.8))  # 80% unreserved
-    res_spaces1 = total_spaces1 - unres_spaces1
-
-    scenario2 = {
-        "name1": "Low Rent Base",
-        "sd1": date.today(),
-        "tm1": 84,  # 7 years
-        "sq1": sqft,
-        "b1": 44.0,  # Lower base rent
-        "ci1": False,  # Using default 3% increase
-        "r1": 3.0,
-        "lt1": "Triple Net (NNN)",
-        "ox1": 12.0,
-        "oi1": 3.0,
-        "pc1": 150.0,
-        "ps1": total_spaces1,
-        "mv1": 5.0,  # Moving expense $5/SF
-        "cc1": 55.0,
-        "fr1": 2,  # Fewer free months
-        "ti1": 40.0,  # Lower TI
-        "ac1": 15.0,  # Additional credit $15/SF
-        "dr1": 5.0,
-        # Parking details
-        "rt_unres1": ratio1,  # Parking ratio per 1,000 SF
-        "ps_unres1": unres_spaces1,
-        "pc_unres1": 150.0,
-        "ps_res1": res_spaces1,
-        "pc_res1": 250.0,
-        "cab1": True,  # Using custom abatement
-        "tifx1": False,
-        "acfx1": False,
-        "mvfx1": False,
-        "ccfx1": False,
-        "inside_term1": False,
-        # Custom abatement - 1 month for first 3 years
-        "abate_1_1": 1,  # Year 1: 1 month abated
-        "abate_1_2": 1,  # Year 2: 1 month abated
-        "abate_1_3": 1,  # Year 3: 1 month abated
-        "abate_1_4": 0,  # No abatement for remaining years
-        "abate_1_5": 0,
-        "abate_1_6": 0,
-        "abate_1_7": 0
-    }
-    
-    # Update session state with both scenarios
-    for key, value in scenario1.items():
-        st.session_state[key] = value
-    for key, value in scenario2.items():
-        st.session_state[key] = value
 
 # Global styling
 st.markdown("""
@@ -481,34 +359,24 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-def header(text, icon=""):
-    return f"""
-    <div style="display: inline-block; margin: 0; padding: 0;">
-        <span class="header-text">{icon} {text}</span>
-    </div>
-    """
-
-def subheader(text, icon=""):
-    return f"""
-    <div style="display: inline-block; margin: 0; padding: 0;">
-        <span class="subheader-text">{icon} {text}</span>
-    </div>
-    """
-
 # Create header container
 with st.container():
     col1, col2 = st.columns([0.85, 0.15])
     with col1:
         st.markdown('<h1 style="font-size: 4rem;">Lease Analyzer</h1>', unsafe_allow_html=True)
     with col2:
-        pass  # Logo removed as requested
+        pass  # Logo removed from header
 
 st.caption("Created by Peyton Dowd")
 st.markdown("---")
 
-# Move Savills logo to the top of the sidebar
-logo = Image.open("savills_logo.png")
-st.sidebar.image(logo, width=300)
+# Try to load the logo, with error handling
+try:
+    logo = load_logo()
+    if logo:
+        st.sidebar.image(logo, width=300)
+except Exception as e:
+    st.sidebar.warning("Logo not available")
 
 tab_inputs, tab_analysis, tab_comparison = st.tabs(["Inputs","Analysis","Comparison"])
 
@@ -1322,7 +1190,15 @@ with tab_comparison:
                 pdf = FPDF()
                 pdf.set_auto_page_break(auto=True, margin=15)
                 pdf.add_page()
-                pdf.image("savills_logo.png", x=10, y=10, w=40)
+                
+                # Try to add logo to PDF using the asset path function
+                try:
+                    logo_path = get_asset_path("savills_logo.png")
+                    pdf.image(logo_path, x=10, y=10, w=40)
+                except Exception:
+                    # Continue without logo if not available
+                    pass
+                    
                 pdf.ln(20)  # space below the logo
 
                 pdf.set_font("Arial", 'B', 16)
