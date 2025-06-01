@@ -1,7 +1,9 @@
-streamlit
-pandas
-numpy-financial
-plotly
-fpdf
-Pillow
-pyairtable
+streamlit==1.32.0
+pandas==2.2.1
+numpy==1.26.4
+numpy-financial==1.0.0
+plotly==5.19.0
+fpdf==1.7.2
+Pillow==10.2.0
+python-dateutil==2.8.2
+openpyxl>=3.1.2
