@@ -12,7 +12,7 @@ from dateutil.relativedelta import relativedelta
 import plotly.graph_objects as go
 import streamlit.components.v1 as components
 
-# Add cache-control headers
+# Clear cache and set page config
 st.set_page_config(
     page_title="Savills Lease Analyzer",
     page_icon="📊",
@@ -25,16 +25,14 @@ st.set_page_config(
     }
 )
 
-# Add no-cache headers
+# Clear cache on load
 components.html(
     """
     <script>
-        // Clear browser cache on load
-        window.onload = function() {
-            if(!window.location.hash) {
-                window.location = window.location + '#loaded';
-                window.location.reload();
-            }
+        // Force clear cache and reload
+        if (window.location.href.indexOf('reload')==-1) {
+            window.location.href=window.location.href+'?reload';
+            window.location.reload();
         }
     </script>
     """,
@@ -46,6 +44,32 @@ if 'saved_scenarios' not in st.session_state:
     st.session_state.saved_scenarios = {}
 if 'count' not in st.session_state:
     st.session_state.count = 1
+
+def load_test_data():
+    """Load sample data for testing"""
+    test_data = {
+        "name0": "Test Option",
+        "sd0": date.today(),
+        "tm0": 120,  # 10 years
+        "sq0": 10000,  # 10,000 SF
+        "b0": 46.0,  # $46/SF/yr base rent
+        "ci0": False,  # No custom rent increases
+        "r0": 3.0,  # 3% annual rent increase
+        "lt0": "Triple Net (NNN)",
+        "ox0": 12.0,  # $12/SF/yr OpEx
+        "oi0": 3.0,  # 3% annual OpEx increase
+        "pc0": 150.0,  # $150/space/month parking
+        "ps0": 30,  # 30 parking spaces
+        "mv0": 5.0,  # $5/SF moving expense
+        "cc0": 0.0,  # No construction cost
+        "fr0": 3,  # 3 months free rent
+        "ti0": 50.0,  # $50/SF TI allowance
+        "ac0": 0.0,  # No additional credits
+        "dr0": 8.0  # 8% discount rate
+    }
+    # Update session state with test data
+    for key, value in test_data.items():
+        st.session_state[key] = value
 
 # Function to get asset path
 def get_asset_path(filename):
@@ -407,17 +431,13 @@ with st.sidebar:
     
     # Test Data Section in an expander
     with st.expander("🧪 Test Data", expanded=False):
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("Single Option", use_container_width=True):
+        try:
+            if st.button("Load Sample Data", use_container_width=True):
                 load_test_data()
-                st.success("Single option test data loaded!")
+                st.success("Sample data loaded!")
                 st.rerun()
-        with col2:
-            if st.button("Compare Two", use_container_width=True):
-                load_comparison_test_data()
-                st.success("Comparison test data loaded!")
-                st.rerun()
+        except Exception as e:
+            st.error("Error loading test data. Please try refreshing the page.")
     
     # Save/Load Section in an expander
     with st.expander("💾 Save & Load Scenarios", expanded=False):
