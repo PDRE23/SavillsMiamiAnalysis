@@ -10,6 +10,8 @@ enableCORS = true
 enableXsrfProtection = true
 maxUploadSize = 200
 maxMessageSize = 200
+enableWebsocketCompression = false
+headless = true
 
 [browser]
 gatherUsageStats = false
@@ -18,10 +20,15 @@ serverPort = 8501
 
 [client]
 showErrorDetails = true
-caching = true
+caching = false
 displayEnabled = true
+toolbarMode = "minimal"
 
 [runner]
 magicEnabled = true
 installTracer = true
-fixMatplotlib = true 
+fixMatplotlib = true
+fastReruns = true
+
+[logger]
+level = "info" 

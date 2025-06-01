@@ -12,12 +12,33 @@ from dateutil.relativedelta import relativedelta
 import plotly.graph_objects as go
 import streamlit.components.v1 as components
 
-# Set page config first, before any other Streamlit commands
+# Add cache-control headers
 st.set_page_config(
     page_title="Savills Lease Analyzer",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
+    menu_items={
+        'Get Help': None,
+        'Report a bug': None,
+        'About': None
+    }
+)
+
+# Add no-cache headers
+components.html(
+    """
+    <script>
+        // Clear browser cache on load
+        window.onload = function() {
+            if(!window.location.hash) {
+                window.location = window.location + '#loaded';
+                window.location.reload();
+            }
+        }
+    </script>
+    """,
+    height=0
 )
 
 # Initialize session state
