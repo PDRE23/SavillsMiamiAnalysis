@@ -237,6 +237,11 @@ def analyze_lease(p):
         "Include OpEx":      include_opex,
     }
 
+    # Set Total Cost to sum of Net Rent
+    if 'Net Rent' in rows:
+        total_cost = sum(abs(net_rent) for net_rent in cfs)
+        summary['Total Cost'] = f"${total_cost:,.0f}"
+
     return summary, pd.DataFrame(rows)
 
 
@@ -1300,22 +1305,19 @@ with tab_comparison:
             "Lease Type": r[0].get("lease_type", "")
         } for r in results])
 
-        st.markdown('<div class="section-header">Comparison Summary</div>', unsafe_allow_html=True)
-        
-        # Format the dataframe values
-        def format_value(val):
-            if isinstance(val, (int, float)):
-                return f"${val:,.0f}"
-            return str(val)
-            
-        formatted_df = df.applymap(format_value)
-        
-        # Display the formatted dataframe without styling
-        st.dataframe(formatted_df, use_container_width=True)
+        st.markdown("## Comparison Summary")
+        st.dataframe(df, use_container_width=True)
 
         # Excel export
         if not df.empty:
-            # PDF export only
+            excel_buf = io.BytesIO()
+            with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
+                df.to_excel(writer, sheet_name="Summary", index=False)
+            st.download_button("📥 Download Comparison Excel", excel_buf.getvalue(),
+                               file_name="comparison.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+            # PDF export
             if st.button("📄 Generate PDF Summary"):
                 pdf = FPDF()
                 pdf.set_auto_page_break(auto=True, margin=15)
@@ -1364,26 +1366,34 @@ with tab_comparison:
                             cost_fig.add_trace(go.Bar(name=name, x=wf["Year"], y=wf[name]))
                     cost_fig.update_layout(
                         barmode="stack",
+                        title="Annual Cost Breakdown",
                         xaxis_title="Year",
                         yaxis_title="Cost ($)",
                         margin=dict(t=30, b=30),
-                        legend_title_text="",
-                        hovermode="x unified",
-                        template="plotly_white",
-                        showlegend=True,
-                        legend=dict(
-                            orientation="h",
-                            yanchor="bottom",
-                            y=1.02,
-                            xanchor="center",
-                            x=0.5
-                        )
+                        legend_title_text="Category"
                     )
 
-                    # Save chart to temporary file
+                    # Net CF Breakdown Chart
+                    netcf_fig = go.Figure()
+                    netcf_fig.add_trace(go.Bar(name="Rent Abatement", x=wf["Year"], y=wf["Rent Abatement"]))
+                    netcf_fig.add_trace(go.Bar(name="Net CF", x=wf["Year"], y=wf["Net CF"]))
+                    netcf_fig.update_layout(
+                        barmode="relative",
+                        title="Net Cash Flow",
+                        xaxis_title="Year",
+                        yaxis_title="Net Impact ($)",
+                        margin=dict(t=30, b=30),
+                        legend_title_text="Component"
+                    )
+
+                    # Save both charts to temporary files
                     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as cost_tmp:
                         cost_fig.write_image(cost_tmp.name, format="png", width=700, height=400)
                         cost_img_path = cost_tmp.name
+
+                    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as netcf_tmp:
+                        netcf_fig.write_image(netcf_tmp.name, format="png", width=700, height=400)
+                        netcf_img_path = netcf_tmp.name
 
                     # Insert into PDF
                     pdf.ln(5)
@@ -1391,10 +1401,15 @@ with tab_comparison:
                     pdf.cell(0, 10, "Annual Cost Breakdown", ln=True)
                     pdf.image(cost_img_path, w=pdf.w - 30)
 
+                    pdf.ln(5)
+                    pdf.set_font("Arial", 'B', 12)
+                    pdf.cell(0, 10, "Net Cash Flow Breakdown", ln=True)
+                    pdf.image(netcf_img_path, w=pdf.w - 30)
+
                     # Cash-Flow Table
                     pdf.ln(5)
                     pdf.set_font("Arial", 'B', 12)
-                    pdf.cell(0, 10, "Annual Rent Schedule", ln=True)
+                    pdf.cell(0, 10, "Annual Cash Flow Table", ln=True)
                     pdf.set_font("Arial", '', 8)
                     cols = wf.columns.tolist()
                     for col in cols:
