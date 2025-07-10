@@ -20,14 +20,10 @@ serverPort = 8501
 
 [client]
 showErrorDetails = true
-caching = false
-displayEnabled = true
 toolbarMode = "minimal"
 
 [runner]
 magicEnabled = true
-installTracer = true
-fixMatplotlib = true
 fastReruns = true
 
 [logger]

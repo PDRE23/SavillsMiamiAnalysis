@@ -322,6 +322,273 @@ def analyze_lease(p):
     return summary, pd.DataFrame(rows)
 
 
+def analyze_purchase_vs_lease(purchase_params, lease_scenario, analysis_period):
+    """
+    Analyze purchase vs lease comparison
+    
+    Args:
+        purchase_params: dict with purchase parameters
+        lease_scenario: existing lease analysis results
+        analysis_period: number of years to analyze
+    
+    Returns:
+        dict with comparison results and DataFrames
+    """
+    # Extract purchase parameters
+    purchase_price = purchase_params['purchase_price']
+    down_payment_pct = purchase_params['down_payment_pct']
+    mortgage_rate = purchase_params['mortgage_rate']
+    mortgage_term = purchase_params['mortgage_term']
+    property_tax_rate = purchase_params['property_tax_rate']
+    insurance_rate = purchase_params['insurance_rate']
+    maintenance_rate = purchase_params['maintenance_rate']
+    appreciation_rate = purchase_params['appreciation_rate']
+    discount_rate = purchase_params['discount_rate']
+    
+    # Calculate mortgage details
+    down_payment = purchase_price * (down_payment_pct / 100)
+    loan_amount = purchase_price - down_payment
+    monthly_rate = mortgage_rate / 100 / 12
+    num_payments = mortgage_term * 12
+    
+    # Calculate monthly mortgage payment
+    if loan_amount > 0 and monthly_rate > 0:
+        monthly_payment = loan_amount * (monthly_rate * (1 + monthly_rate)**num_payments) / ((1 + monthly_rate)**num_payments - 1)
+    else:
+        monthly_payment = 0
+    
+    annual_mortgage = monthly_payment * 12
+    
+    # Initialize cash flow arrays
+    purchase_cash_flows = []
+    lease_cash_flows = []
+    purchase_rows = []
+    lease_rows = []
+    
+    # Calculate purchase cash flows
+    for year in range(1, analysis_period + 1):
+        # Property value with appreciation
+        property_value = purchase_price * (1 + appreciation_rate/100)**year
+        
+        # Annual costs
+        property_tax = property_value * (property_tax_rate / 100)
+        insurance = property_value * (insurance_rate / 100)
+        maintenance = property_value * (maintenance_rate / 100)
+        
+        # Mortgage payment (only for mortgage term years)
+        mortgage_payment = annual_mortgage if year <= mortgage_term else 0
+        
+        # Total annual cost
+        total_cost = mortgage_payment + property_tax + insurance + maintenance
+        
+        # Cash flow (negative for costs)
+        cash_flow = -total_cost
+        
+        # Add to arrays
+        purchase_cash_flows.append(cash_flow)
+        purchase_rows.append({
+            "Year": year,
+            "Property Value": f"${property_value:,.0f}",
+            "Mortgage Payment": f"${mortgage_payment:,.0f}",
+            "Property Tax": f"${property_tax:,.0f}",
+            "Insurance": f"${insurance:,.0f}",
+            "Maintenance": f"${maintenance:,.0f}",
+            "Total Cost": f"${total_cost:,.0f}",
+            "Cash Flow": f"${cash_flow:,.0f}"
+        })
+    
+    # Calculate lease cash flows (use existing lease analysis)
+    lease_summary, lease_waterfall = lease_scenario
+    
+    # Extract lease cash flows from the waterfall
+    if 'Net CF' in lease_waterfall.columns:
+        lease_cash_flows = lease_waterfall['Net CF'].tolist()
+        # Extend to analysis period if needed
+        while len(lease_cash_flows) < analysis_period:
+            # Use the last year's cash flow for remaining years
+            lease_cash_flows.append(lease_cash_flows[-1] if lease_cash_flows else 0)
+        lease_cash_flows = lease_cash_flows[:analysis_period]
+    else:
+        lease_cash_flows = [0] * analysis_period
+    
+    # Create lease rows for comparison
+    for year in range(1, analysis_period + 1):
+        if year <= len(lease_waterfall):
+            row = lease_waterfall.iloc[year-1]
+            lease_rows.append({
+                "Year": year,
+                "Period": row.get("Period", f"Year {year}"),
+                "Base Rent": f"${row.get('Base Cost', 0):,.0f}",
+                "OpEx": f"${row.get('Opex Cost', 0):,.0f}",
+                "Parking": f"${row.get('Parking Exp', 0):,.0f}",
+                "Abatement": f"${abs(row.get('Rent Abatement', 0)):,.0f}",
+                "Net CF": f"${row.get('Net CF', 0):,.0f}"
+            })
+        else:
+            # Extend with last year's values
+            lease_rows.append({
+                "Year": year,
+                "Period": f"Year {year}",
+                "Base Rent": f"${0:,.0f}",
+                "OpEx": f"${0:,.0f}",
+                "Parking": f"${0:,.0f}",
+                "Abatement": f"${0:,.0f}",
+                "Net CF": f"${0:,.0f}"
+            })
+    
+    # Calculate financial metrics
+    # Purchase metrics
+    total_purchase_cost = sum(abs(cf) for cf in purchase_cash_flows)
+    purchase_npv = npf.npv(discount_rate/100, purchase_cash_flows)
+    
+    # Lease metrics
+    total_lease_cost = sum(abs(cf) for cf in lease_cash_flows)
+    lease_npv = npf.npv(discount_rate/100, lease_cash_flows)
+    
+    # Equity at end of analysis period
+    final_property_value = purchase_price * (1 + appreciation_rate/100)**analysis_period
+    remaining_loan = 0  # Simplified - assume loan is paid off
+    equity = final_property_value - remaining_loan
+    
+    # Net purchase position (including equity)
+    net_purchase_position = purchase_npv + equity
+    
+    # Comparison summary
+    comparison_summary = {
+        "Analysis Period": f"{analysis_period} years",
+        "Purchase Price": f"${purchase_price:,.0f}",
+        "Down Payment": f"${down_payment:,.0f}",
+        "Loan Amount": f"${loan_amount:,.0f}",
+        "Monthly Payment": f"${monthly_payment:,.0f}",
+        "Total Purchase Cost": f"${total_purchase_cost:,.0f}",
+        "Purchase NPV": f"${abs(purchase_npv):,.0f}",
+        "Final Property Value": f"${final_property_value:,.0f}",
+        "Equity": f"${equity:,.0f}",
+        "Net Purchase Position": f"${net_purchase_position:,.0f}",
+        "Total Lease Cost": f"${total_lease_cost:,.0f}",
+        "Lease NPV": f"${abs(lease_npv):,.0f}",
+        "Difference (Purchase - Lease)": f"${net_purchase_position - lease_npv:,.0f}",
+        "Recommendation": "Purchase" if net_purchase_position < lease_npv else "Lease"
+    }
+    
+    return {
+        'summary': comparison_summary,
+        'purchase_df': pd.DataFrame(purchase_rows),
+        'lease_df': pd.DataFrame(lease_rows),
+        'purchase_cash_flows': purchase_cash_flows,
+        'lease_cash_flows': lease_cash_flows
+    }
+
+
+def analyze_purchase(p):
+    """
+    Analyze a purchase scenario
+    
+    Args:
+        p: dict with purchase parameters
+    
+    Returns:
+        dict with summary and DataFrame
+    """
+    # Extract parameters
+    purchase_price = p["purchase_price"]
+    down_payment_pct = p["down_payment_pct"]
+    mortgage_rate = p["mortgage_rate"]
+    mortgage_term = p["mortgage_term"]
+    property_tax_rate = p["property_tax_rate"]
+    insurance_rate = p["insurance_rate"]
+    maintenance_rate = p["maintenance_rate"]
+    appreciation_rate = p["appreciation_rate"]
+    analysis_period = p["analysis_period"]
+    discount_rate = p["discount_rate"]
+    
+    # Calculate mortgage details
+    down_payment = purchase_price * (down_payment_pct / 100)
+    loan_amount = purchase_price - down_payment
+    monthly_rate = mortgage_rate / 100 / 12
+    num_payments = mortgage_term * 12
+    
+    # Calculate monthly mortgage payment
+    if loan_amount > 0 and monthly_rate > 0:
+        monthly_payment = loan_amount * (monthly_rate * (1 + monthly_rate)**num_payments) / ((1 + monthly_rate)**num_payments - 1)
+    else:
+        monthly_payment = 0
+    
+    annual_mortgage = monthly_payment * 12
+    
+    # Initialize arrays
+    cash_flows = []
+    rows = []
+    
+    # Calculate cash flows for each year
+    for year in range(1, analysis_period + 1):
+        # Property value with appreciation
+        property_value = purchase_price * (1 + appreciation_rate/100)**year
+        
+        # Annual costs
+        property_tax = property_value * (property_tax_rate / 100)
+        insurance = property_value * (insurance_rate / 100)
+        maintenance = property_value * (maintenance_rate / 100)
+        
+        # Mortgage payment (only for mortgage term years)
+        mortgage_payment = annual_mortgage if year <= mortgage_term else 0
+        
+        # Total annual cost
+        total_cost = mortgage_payment + property_tax + insurance + maintenance
+        
+        # Cash flow (negative for costs)
+        cash_flow = -total_cost
+        
+        # Add to arrays
+        cash_flows.append(cash_flow)
+        rows.append({
+            "Year": year,
+            "Property Value": f"${property_value:,.0f}",
+            "Mortgage Payment": f"${mortgage_payment:,.0f}",
+            "Property Tax": f"${property_tax:,.0f}",
+            "Insurance": f"${insurance:,.0f}",
+            "Maintenance": f"${maintenance:,.0f}",
+            "Total Cost": f"${total_cost:,.0f}",
+            "Cash Flow": f"${cash_flow:,.0f}"
+        })
+    
+    # Calculate financial metrics
+    total_cost = sum(abs(cf) for cf in cash_flows)
+    npv = npf.npv(discount_rate/100, cash_flows)
+    
+    # Equity at end of analysis period
+    final_property_value = purchase_price * (1 + appreciation_rate/100)**analysis_period
+    remaining_loan = 0  # Simplified - assume loan is paid off
+    equity = final_property_value - remaining_loan
+    
+    # Net position (including equity)
+    net_position = npv + equity
+    
+    # Calculate IRR (if possible)
+    try:
+        irr = npf.irr(cash_flows) * 100 if len(cash_flows) > 1 else None
+    except:
+        irr = None
+    
+    # Summary
+    summary = {
+        "Option": p["name"],
+        "Purchase Price": f"${purchase_price:,.0f}",
+        "Down Payment": f"${down_payment:,.0f}",
+        "Loan Amount": f"${loan_amount:,.0f}",
+        "Monthly Payment": f"${monthly_payment:,.0f}",
+        "Analysis Period": f"{analysis_period} years",
+        "Total Cost": f"${total_cost:,.0f}",
+        "NPV": f"${abs(npv):,.0f}",
+        "Final Property Value": f"${final_property_value:,.0f}",
+        "Equity": f"${equity:,.0f}",
+        "Net Position": f"${net_position:,.0f}",
+        "IRR": f"{irr:.2f}%" if irr else "N/A"
+    }
+    
+    return summary, pd.DataFrame(rows)
+
+
 # -- Streamlit UI Setup --
 
 # Global styling
@@ -415,6 +682,23 @@ with st.container():
 st.caption("Created by Peyton Dowd")
 st.markdown("---")
 
+# Add mode toggle switch
+st.markdown("### Analysis Mode")
+mode = st.radio(
+    "Select Analysis Type:",
+    ["🏢 Lease Analyzer", "🏠 Buy Analyzer"],
+    horizontal=True,
+    key="analysis_mode"
+)
+
+# Update header based on mode
+if mode == "🏠 Buy Analyzer":
+    st.markdown('<h1 style="font-size: 4rem;">Buy Analyzer</h1>', unsafe_allow_html=True)
+else:
+    st.markdown('<h1 style="font-size: 4rem;">Lease Analyzer</h1>', unsafe_allow_html=True)
+
+st.markdown("---")
+
 # Try to load the logo, with error handling
 try:
     logo = load_logo()
@@ -423,7 +707,11 @@ try:
 except Exception as e:
     st.sidebar.warning("Logo not available")
 
-tab_inputs, tab_analysis, tab_comparison = st.tabs(["Inputs","Analysis","Comparison"])
+# Conditional tabs based on mode
+if mode == "🏠 Buy Analyzer":
+    tab_inputs, tab_analysis, tab_comparison, tab_compare = st.tabs(["Inputs","Analysis","Comparison","Purchase vs. Lease"])
+else:
+    tab_inputs, tab_analysis, tab_comparison, tab_compare = st.tabs(["Inputs","Analysis","Comparison","Purchase vs. Lease"])
 
 # Sidebar for inputs
 with st.sidebar:
@@ -515,246 +803,425 @@ components.html(
 
 # ---- Inputs Tab ----
 with tab_inputs:
-    st.header("Configure & Compare Scenarios")
-    count = st.number_input("Number of Scenarios", 1, 10, key="count")
+    if mode == "🏠 Buy Analyzer":
+        st.header("Configure Purchase Scenarios")
+        count = st.number_input("Number of Purchase Scenarios", 1, 10, key="buy_count")
+        
+        buy_inputs = []
+        for i in range(int(count)):
+            with st.expander(f"Purchase Scenario {i+1}", expanded=(i==0)):
+                # Basic Information
+                name = st.text_input("Property Name", key=f"buy_name{i}")
+                if not name:
+                    name = f"Property {i+1}"
+                
+                # Property Details
+                st.markdown("#### Property Details")
+                purchase_price = st.number_input(
+                    "Purchase Price ($)", 
+                    min_value=100000, 
+                    max_value=50000000, 
+                    value=2000000, 
+                    step=50000,
+                    key=f"buy_price{i}"
+                )
+                
+                # Financing Details
+                st.markdown("#### Financing")
+                down_payment_pct = st.number_input(
+                    "Down Payment (%)", 
+                    min_value=5, 
+                    max_value=50, 
+                    value=20, 
+                    step=5,
+                    key=f"buy_down{i}"
+                )
+                
+                mortgage_rate = st.number_input(
+                    "Mortgage Rate (%)", 
+                    min_value=2.0, 
+                    max_value=10.0, 
+                    value=5.5, 
+                    step=0.1,
+                    key=f"buy_rate{i}"
+                )
+                
+                mortgage_term = st.number_input(
+                    "Mortgage Term (years)", 
+                    min_value=15, 
+                    max_value=30, 
+                    value=30, 
+                    step=5,
+                    key=f"buy_term{i}"
+                )
+                
+                # Property Costs
+                st.markdown("#### Property Costs")
+                property_tax_rate = st.number_input(
+                    "Property Tax Rate (%)", 
+                    min_value=0.5, 
+                    max_value=3.0, 
+                    value=1.2, 
+                    step=0.1,
+                    key=f"buy_tax{i}"
+                )
+                
+                insurance_rate = st.number_input(
+                    "Insurance Rate (%)", 
+                    min_value=0.2, 
+                    max_value=1.0, 
+                    value=0.5, 
+                    step=0.1,
+                    key=f"buy_ins{i}"
+                )
+                
+                maintenance_rate = st.number_input(
+                    "Annual Maintenance (% of value)", 
+                    min_value=0.5, 
+                    max_value=3.0, 
+                    value=1.0, 
+                    step=0.1,
+                    key=f"buy_maint{i}"
+                )
+                
+                # Investment Parameters
+                st.markdown("#### Investment Parameters")
+                appreciation_rate = st.number_input(
+                    "Annual Appreciation (%)", 
+                    min_value=0.0, 
+                    max_value=10.0, 
+                    value=3.0, 
+                    step=0.5,
+                    key=f"buy_app{i}"
+                )
+                
+                analysis_period = st.number_input(
+                    "Analysis Period (years)", 
+                    min_value=5, 
+                    max_value=30, 
+                    value=10, 
+                    step=1,
+                    key=f"buy_period{i}"
+                )
+                
+                discount_rate = st.number_input(
+                    "Discount Rate (%)", 
+                    min_value=2.0, 
+                    max_value=15.0, 
+                    value=8.0, 
+                    step=0.5,
+                    key=f"buy_disc{i}"
+                )
+                
+                # Store purchase parameters
+                buy_params = {
+                    "name": name,
+                    "purchase_price": purchase_price,
+                    "down_payment_pct": down_payment_pct,
+                    "mortgage_rate": mortgage_rate,
+                    "mortgage_term": mortgage_term,
+                    "property_tax_rate": property_tax_rate,
+                    "insurance_rate": insurance_rate,
+                    "maintenance_rate": maintenance_rate,
+                    "appreciation_rate": appreciation_rate,
+                    "analysis_period": analysis_period,
+                    "discount_rate": discount_rate
+                }
+                buy_inputs.append(buy_params)
+        
+        # Store in session state
+        st.session_state.buy_inputs = buy_inputs
+        
+        # Run Analysis Button for purchase scenarios
+        st.markdown("---")
+        st.markdown("""
+            <style>
+            /* Main button styling */
+            .stButton > button {
+                background-color: #0066cc !important;
+                color: white !important;
+                font-size: 1.2em !important;
+                font-weight: 500 !important;
+                padding: 0.7em 1em !important;
+                border-radius: 6px !important;
+                border: none !important;
+                box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1) !important;
+                transition: all 0.2s ease !important;
+                width: 100% !important;
+                margin: 0.5em 0 !important;
+            }
 
-    inputs = []
-    for i in range(int(count)):
-        with st.expander(f"Scenario {i+1}", expanded=(i==0)):
-            # Space & Term Section
-            st.markdown("#### Space & Term")
-            
-            # Basic Information
-            name = st.text_input("Name", key=f"name{i}")
-            if not name:  # If no name is provided, use default
-                name = f"Option {i+1}"
-            if f"sd{i}" not in st.session_state:
-                st.session_state[f"sd{i}"] = date.today()
-            start_dt = st.date_input("Lease Commencement", key=f"sd{i}")
-            term_mos = st.number_input("Lease Term (months)", min_value=0, max_value=600, step=1, key=f"tm{i}")
-            
-            initial_sqft = st.number_input("Initial RSF", min_value=0, max_value=200000, step=1, key=f"sq{i}")
-            has_size_change = st.checkbox("Include Size Change", key=f"exp{i}")
-            
-            if has_size_change:
-                if term_mos > 0:
-                    default_change_month = min(12, term_mos)
-                    change_month = st.number_input("Change Month", min_value=1, max_value=term_mos, step=1, key=f"em{i}")
-                    # Calculate which year the change occurs in
-                    change_year = (change_month - 1) // 12 + 1
-                    max_reduction = -initial_sqft if initial_sqft > 0 else 0
-                    change_sqft = st.number_input("Size Change (±RSF)", min_value=max_reduction, max_value=200000, step=1, key=f"es{i}")
-                    total_sqft = initial_sqft + change_sqft
-                    if total_sqft > 0:
-                        change_type = "expansion" if change_sqft > 0 else "reduction" if change_sqft < 0 else "no change"
-                        if change_sqft != 0:
-                            st.caption(f"→ {abs(change_sqft):,} SF {change_type} in month {change_month} (Year {change_year})")
-                        st.caption(f"→ Total SF after change: {total_sqft:,}")
-                    else:
-                        st.error("Total SF cannot be negative or zero")
-                        total_sqft = initial_sqft
-                        change_sqft = 0
+            /* Hover state */
+            .stButton > button:hover {
+                background-color: #0052a3 !important;
+                box-shadow: 0 4px 6px rgba(0, 0, 0, 0.15) !important;
+                transform: translateY(-1px) !important;
+            }
+
+            /* Active/Click state */
+            .stButton > button:active {
+                transform: translateY(0px) !important;
+                box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1) !important;
+                background-color: #004080 !important;
+            }
+            </style>
+        """, unsafe_allow_html=True)
+        
+        col1, col2, col3 = st.columns([1, 1, 1])
+        with col2:
+            if st.button("🚀 Run Purchase Analysis", use_container_width=True):
+                if len(buy_inputs) > 0:
+                    st.session_state["buy_results"] = [(p, *analyze_purchase(p)) for p in buy_inputs]
+                    st.query_params.update({"tab": "analysis"})
+                    st.success("Purchase analysis complete! Switch to the Analysis tab to view results.")
                 else:
-                    st.warning("Please set lease term before adding size change")
+                    st.error("Please configure at least one purchase scenario before running analysis.")
+        
+        st.markdown("---")
+        st.markdown("<p style='font-size: 0.8em; color: gray;'>© 2025 Savills. All rights reserved.</p>", unsafe_allow_html=True)
+        
+    else:
+        # Original lease inputs
+        st.header("Configure & Compare Scenarios")
+        count = st.number_input("Number of Scenarios", 1, 10, key="count")
+
+        inputs = []
+        for i in range(int(count)):
+            with st.expander(f"Scenario {i+1}", expanded=(i==0)):
+                # Space & Term Section
+                st.markdown("#### Space & Term")
+                
+                # Basic Information
+                name = st.text_input("Name", key=f"name{i}")
+                if not name:  # If no name is provided, use default
+                    name = f"Option {i+1}"
+                if f"sd{i}" not in st.session_state:
+                    st.session_state[f"sd{i}"] = date.today()
+                start_dt = st.date_input("Lease Commencement", key=f"sd{i}")
+                term_mos = st.number_input("Lease Term (months)", min_value=0, max_value=600, step=1, key=f"tm{i}")
+                
+                initial_sqft = st.number_input("Initial RSF", min_value=0, max_value=200000, step=1, key=f"sq{i}")
+                has_size_change = st.checkbox("Include Size Change", key=f"exp{i}")
+                
+                if has_size_change:
+                    if term_mos > 0:
+                        default_change_month = min(12, term_mos)
+                        change_month = st.number_input("Change Month", min_value=1, max_value=term_mos, step=1, key=f"em{i}")
+                        # Calculate which year the change occurs in
+                        change_year = (change_month - 1) // 12 + 1
+                        max_reduction = -initial_sqft if initial_sqft > 0 else 0
+                        change_sqft = st.number_input("Size Change (±RSF)", min_value=max_reduction, max_value=200000, step=1, key=f"es{i}")
+                        total_sqft = initial_sqft + change_sqft
+                        if total_sqft > 0:
+                            change_type = "expansion" if change_sqft > 0 else "reduction" if change_sqft < 0 else "no change"
+                            if change_sqft != 0:
+                                st.caption(f"→ {abs(change_sqft):,} SF {change_type} in month {change_month} (Year {change_year})")
+                            st.caption(f"→ Total SF after change: {total_sqft:,}")
+                        else:
+                            st.error("Total SF cannot be negative or zero")
+                            total_sqft = initial_sqft
+                            change_sqft = 0
+                    else:
+                        st.warning("Please set lease term before adding size change")
+                        change_month = 0
+                        change_sqft = 0
+                        total_sqft = initial_sqft
+                else:
                     change_month = 0
                     change_sqft = 0
                     total_sqft = initial_sqft
-            else:
-                change_month = 0
-                change_sqft = 0
-                total_sqft = initial_sqft
-            
-            st.markdown("---")
+                
+                st.markdown("---")
 
-            # Rent & Operating Costs Section
-            st.markdown("#### Rent & Operating Costs")
-            
-            # Base Rent Subsection
-            st.markdown("##### Base Rent")
-            base = st.number_input("Base Rent ($/SF/yr)", min_value=0.0, max_value=1000.0, step=0.01, format="%.2f", key=f"b{i}")
-            custom_inc = st.checkbox("Custom Rent ↑ per Year", key=f"ci{i}")
-            if custom_inc:
-                yrs = term_mos//12 + (1 if term_mos%12 else 0)
-                rent_incs = [st.number_input(f"Year {y} ↑ (%)", min_value=0.0, max_value=100.0, step=0.01, format="%.2f", key=f"yrinc_{i}_{y}") for y in range(1, int(yrs)+1)]
-            else:
-                rent_incs = None
-                inc = st.number_input("Base Rent ↑ (%)", min_value=0.0, max_value=100.0, step=0.01, format="%.2f", key=f"r{i}")
+                # Rent & Operating Costs Section
+                st.markdown("#### Rent & Operating Costs")
+                
+                # Base Rent Subsection
+                st.markdown("##### Base Rent")
+                base = st.number_input("Base Rent ($/SF/yr)", min_value=0.0, max_value=1000.0, step=0.01, format="%.2f", key=f"b{i}")
+                custom_inc = st.checkbox("Custom Rent ↑ per Year", key=f"ci{i}")
+                if custom_inc:
+                    yrs = term_mos//12 + (1 if term_mos%12 else 0)
+                    rent_incs = [st.number_input(f"Year {y} ↑ (%)", min_value=0.0, max_value=100.0, step=0.01, format="%.2f", key=f"yrinc_{i}_{y}") for y in range(1, int(yrs)+1)]
+                else:
+                    rent_incs = None
+                    inc = st.number_input("Base Rent ↑ (%)", min_value=0.0, max_value=100.0, step=0.01, format="%.2f", key=f"r{i}")
 
-            # Operating Expenses Subsection
-            st.markdown("##### Operating Expenses")
-            lease_type = st.selectbox(
-                "Lease Type",
-                ["Full Service (Gross)", "Triple Net (NNN)"],
-                key=f"lt{i}"
-            )
+                # Operating Expenses Subsection
+                st.markdown("##### Operating Expenses")
+                lease_type = st.selectbox(
+                    "Lease Type",
+                    ["Full Service (Gross)", "Triple Net (NNN)"],
+                    key=f"lt{i}"
+                )
 
-            if lease_type == "Triple Net (NNN)":
-                opex = st.number_input("OPEX ($/SF/yr)", min_value=0.0, max_value=500.0, step=0.01, format="%.2f", key=f"ox{i}")
-                opexinc = st.number_input("Estimated OpEx ↑ (%)", min_value=0.0, max_value=100.0, step=0.01, format="%.2f", key=f"oi{i}")
-                opex_base = None  # NNN pays everything
-            else:
-                opex = 0.0  # Full Service doesn't pay OPEX
-                opexinc = 0.0  # No OPEX increase for Full Service
-                opex_base = None  # No base year for Full Service
+                if lease_type == "Triple Net (NNN)":
+                    opex = st.number_input("OPEX ($/SF/yr)", min_value=0.0, max_value=500.0, step=0.01, format="%.2f", key=f"ox{i}")
+                    opexinc = st.number_input("Estimated OpEx ↑ (%)", min_value=0.0, max_value=100.0, step=0.01, format="%.2f", key=f"oi{i}")
+                    opex_base = None  # NNN pays everything
+                else:
+                    opex = 0.0  # Full Service doesn't pay OPEX
+                    opexinc = 0.0  # No OPEX increase for Full Service
+                    opex_base = None  # No base year for Full Service
 
-            # Parking Subsection
-            st.markdown("##### Parking")
-            fxp = st.checkbox("Fixed Parking Spaces", key=f"fxp{i}")
-            if fxp:
-                unres_spaces = st.number_input("Unreserved Spaces", min_value=0, max_value=500, step=1, key=f"ps_unres{i}")
-                unres_cost = st.number_input("Unreserved $/space/mo", min_value=0.0, max_value=500.0, step=0.01, format="%.2f", key=f"pc_unres{i}")
-                res_spaces = st.number_input("Reserved Spaces", min_value=0, max_value=500, step=1, key=f"ps_res{i}")
-                res_cost = st.number_input("Reserved $/space/mo", min_value=0.0, max_value=1000.0, step=0.01, format="%.2f", key=f"pc_res{i}")
-            else:
-                unres_ratio = st.number_input("Unreserved Ratio (spaces/1k SF)", min_value=0.0, max_value=100.0, step=0.01, format="%.2f", key=f"rt_unres{i}")
-                total_spaces = unres_ratio * (initial_sqft or 0) / 1000
-                res_spaces = st.number_input("Reserved Spaces", min_value=0, max_value=500, step=1, key=f"ps_res{i}")
-                unres_spaces = int(round(max(total_spaces - res_spaces, 0)))
-                st.caption(f"→ {unres_spaces} unreserved, {res_spaces} reserved spaces")
-                unres_cost = st.number_input("Unreserved $/space/mo", min_value=0.0, max_value=500.0, step=0.01, format="%.2f", key=f"pc_unres{i}")
-                res_cost = st.number_input("Reserved $/space/mo", min_value=0.0, max_value=1000.0, step=0.01, format="%.2f", key=f"pc_res{i}")
-            
-            # Add parking escalation input
-            park_inc = st.number_input("Estimated Annual Parking Cost ↑ (%)", min_value=0.0, max_value=100.0, step=0.01, format="%.2f", key=f"pi{i}")
-            
-            park_spaces = unres_spaces + res_spaces
-            park_cost = (unres_cost * unres_spaces + res_cost * res_spaces) / (park_spaces if park_spaces else 1)
-            park_detail = {
-                'unres_spaces': unres_spaces,
-                'unres_cost': unres_cost,
-                'res_spaces': res_spaces,
-                'res_cost': res_cost,
-                'park_inc': park_inc
-            }
+                # Parking Subsection
+                st.markdown("##### Parking")
+                fxp = st.checkbox("Fixed Parking Spaces", key=f"fxp{i}")
+                if fxp:
+                    unres_spaces = st.number_input("Unreserved Spaces", min_value=0, max_value=500, step=1, key=f"ps_unres{i}")
+                    unres_cost = st.number_input("Unreserved $/space/mo", min_value=0.0, max_value=500.0, step=0.01, format="%.2f", key=f"pc_unres{i}")
+                    res_spaces = st.number_input("Reserved Spaces", min_value=0, max_value=500, step=1, key=f"ps_res{i}")
+                    res_cost = st.number_input("Reserved $/space/mo", min_value=0.0, max_value=1000.0, step=0.01, format="%.2f", key=f"pc_res{i}")
+                else:
+                    unres_ratio = st.number_input("Unreserved Ratio (spaces/1k SF)", min_value=0.0, max_value=100.0, step=0.01, format="%.2f", key=f"rt_unres{i}")
+                    total_spaces = unres_ratio * (initial_sqft or 0) / 1000
+                    res_spaces = st.number_input("Reserved Spaces", min_value=0, max_value=500, step=1, key=f"ps_res{i}")
+                    unres_spaces = int(round(max(total_spaces - res_spaces, 0)))
+                    st.caption(f"→ {unres_spaces} unreserved, {res_spaces} reserved spaces")
+                    unres_cost = st.number_input("Unreserved $/space/mo", min_value=0.0, max_value=500.0, step=0.01, format="%.2f", key=f"pc_unres{i}")
+                    res_cost = st.number_input("Reserved $/space/mo", min_value=0.0, max_value=1000.0, step=0.01, format="%.2f", key=f"pc_res{i}")
+                
+                # Add parking escalation input
+                park_inc = st.number_input("Estimated Annual Parking Cost ↑ (%)", min_value=0.0, max_value=100.0, step=0.01, format="%.2f", key=f"pi{i}")
+                
+                park_spaces = unres_spaces + res_spaces
+                park_cost = (unres_cost * unres_spaces + res_cost * res_spaces) / (park_spaces if park_spaces else 1)
+                park_detail = {
+                    'unres_spaces': unres_spaces,
+                    'unres_cost': unres_cost,
+                    'res_spaces': res_spaces,
+                    'res_cost': res_cost,
+                    'park_inc': park_inc
+                }
 
-            st.markdown("---")
+                st.markdown("---")
 
-            # Capital Expenses Section
-            st.markdown("#### Capital Expenses")
-            
-            # Total Construction Cost Subsection
-            st.markdown("##### Total Construction Cost")
-            cc_fx = st.checkbox("Fixed Total Construction Cost (total $)", key=f"ccfx{i}")
-            if cc_fx:
-                cc_tot = st.number_input("Total Construction Cost (total $)", min_value=0.0, max_value=10000000.0, step=0.01, format="%.2f", key=f"cc_tot{i}")
-                const_sf = cc_tot/(initial_sqft or 1)
-                if initial_sqft > 0:
-                    st.caption(f"→ ${const_sf:.2f}/SF")
-            else:
-                const_sf = st.number_input("Total Construction Cost ($/SF)", min_value=0.0, max_value=1000.0, step=0.01, format="%.2f", key=f"cc{i}")
+                # Capital Expenses Section
+                st.markdown("#### Capital Expenses")
+                
+                # Total Construction Cost Subsection
+                st.markdown("##### Total Construction Cost")
+                cc_fx = st.checkbox("Fixed Total Construction Cost (total $)", key=f"ccfx{i}")
+                if cc_fx:
+                    cc_tot = st.number_input("Total Construction Cost (total $)", min_value=0.0, max_value=10000000.0, step=0.01, format="%.2f", key=f"cc_tot{i}")
+                    const_sf = cc_tot/(initial_sqft or 1)
+                    if initial_sqft > 0:
+                        st.caption(f"→ ${const_sf:.2f}/SF")
+                else:
+                    const_sf = st.number_input("Total Construction Cost ($/SF)", min_value=0.0, max_value=1000.0, step=0.01, format="%.2f", key=f"cc{i}")
 
-            # Moving Expense Subsection
-            st.markdown("##### Moving Cost")
-            mv_fx = st.checkbox("Fixed Moving Cost (total $)", key=f"mvfx{i}")
-            if mv_fx:
-                mv_tot = st.number_input("Moving Cost (total $)", min_value=0.0, max_value=10000000.0, step=0.01, format="%.2f", key=f"mv_tot{i}")
-                mv_sf = mv_tot/(initial_sqft or 1)
-                if initial_sqft > 0:
-                    st.caption(f"→ ${mv_sf:.2f}/SF")
-            else:
-                mv_sf = st.number_input("Moving Cost ($/SF)", min_value=0.0, max_value=500.0, step=0.01, format="%.2f", key=f"mv{i}")
+                # Moving Expense Subsection
+                st.markdown("##### Moving Cost")
+                mv_fx = st.checkbox("Fixed Moving Cost (total $)", key=f"mvfx{i}")
+                if mv_fx:
+                    mv_tot = st.number_input("Moving Cost (total $)", min_value=0.0, max_value=10000000.0, step=0.01, format="%.2f", key=f"mv_tot{i}")
+                    mv_sf = mv_tot/(initial_sqft or 1)
+                    if initial_sqft > 0:
+                        st.caption(f"→ ${mv_sf:.2f}/SF")
+                else:
+                    mv_sf = st.number_input("Moving Cost ($/SF)", min_value=0.0, max_value=500.0, step=0.01, format="%.2f", key=f"mv{i}")
 
-            # FF&E Subsection
-            st.markdown("##### FF&E")
-            ffe_fx = st.checkbox("Fixed FF&E Expense (total $)", key=f"ffefx{i}")
-            if ffe_fx:
-                ffe_tot = st.number_input("FF&E Expense (total $)", min_value=0.0, max_value=10000000.0, step=0.01, format="%.2f", key=f"ffe_tot{i}")
-                ffe_sf = ffe_tot/(initial_sqft or 1)
-                if initial_sqft > 0:
-                    st.caption(f"→ ${ffe_sf:.2f}/SF")
-            else:
-                ffe_sf = st.number_input("FF&E Exp ($/SF)", min_value=0.0, max_value=500.0, step=0.01, format="%.2f", key=f"ffe{i}")
+                # FF&E Subsection
+                st.markdown("##### FF&E")
+                ffe_fx = st.checkbox("Fixed FF&E Expense (total $)", key=f"ffefx{i}")
+                if ffe_fx:
+                    ffe_tot = st.number_input("FF&E Expense (total $)", min_value=0.0, max_value=10000000.0, step=0.01, format="%.2f", key=f"ffe_tot{i}")
+                    ffe_sf = ffe_tot/(initial_sqft or 1)
+                    if initial_sqft > 0:
+                        st.caption(f"→ ${ffe_sf:.2f}/SF")
+                else:
+                    ffe_sf = st.number_input("FF&E Exp ($/SF)", min_value=0.0, max_value=500.0, step=0.01, format="%.2f", key=f"ffe{i}")
 
-            st.markdown("---")
+                st.markdown("---")
 
-            # Concessions Section
-            st.markdown("#### Concessions")
-            
-            # Abatement Subsection
-            st.markdown("##### Rent Abatement")
-            lease_type = st.session_state.get(f"lt{i}", "Triple Net (NNN)")
-            base_only = False  # Initialize base_only
-            
-            free_mo = st.number_input("Rent Abatement (mo)", min_value=0, max_value=24, step=1, key=f"fr{i}")
-            cust_ab = st.checkbox("Custom Abatement per Year", key=f"cab{i}")
-            
-            if cust_ab:
-                yrs = term_mos//12 + (1 if term_mos%12 else 0)
-                abates = [st.number_input(f"Year {y} Abate (mo)", min_value=0, max_value=term_mos, step=1, key=f"abate_{i}_{y}") for y in range(1,yrs+1)]
-                free_mo = 0
-            else:
-                abates = None
-            
-            inside_term = st.checkbox("Abatement inside of the Term", key=f"inside_term{i}", help="If checked, abatement months will not extend the lease term")
-            if lease_type == "Triple Net (NNN)":
-                base_only = st.checkbox("Abatement applies to Base Rent only", key=f"base_only{i}", help="If checked, tenant will continue to pay OpEx during abatement period")
+                # Concessions Section
+                st.markdown("#### Concessions")
+                
+                # Abatement Subsection
+                st.markdown("##### Rent Abatement")
+                lease_type = st.session_state.get(f"lt{i}", "Triple Net (NNN)")
+                base_only = False  # Initialize base_only
+                
+                free_mo = st.number_input("Rent Abatement (mo)", min_value=0, max_value=24, step=1, key=f"fr{i}")
+                cust_ab = st.checkbox("Custom Abatement per Year", key=f"cab{i}")
+                
+                if cust_ab:
+                    yrs = term_mos//12 + (1 if term_mos%12 else 0)
+                    abates = [st.number_input(f"Year {y} Abate (mo)", min_value=0, max_value=term_mos, step=1, key=f"abate_{i}_{y}") for y in range(1,yrs+1)]
+                    free_mo = 0
+                else:
+                    abates = None
+                
+                inside_term = st.checkbox("Abatement inside of the Term", key=f"inside_term{i}", help="If checked, abatement months will not extend the lease term")
+                if lease_type == "Triple Net (NNN)":
+                    base_only = st.checkbox("Abatement applies to Base Rent only", key=f"base_only{i}", help="If checked, tenant will continue to pay OpEx during abatement period")
 
-            # TI Allowance Subsection
-            st.markdown("##### TI Allowance")
-            ti_fx = st.checkbox("Fixed TI Allowance (total $)", key=f"tifx{i}")
-            if ti_fx:
-                tot = st.number_input("TI Allowance (total $)", min_value=0.0, max_value=10000000.0, step=0.01, format="%.2f", key=f"titot{i}")
-                ti_sf = tot/(initial_sqft or 1)
-                if initial_sqft > 0:
-                    st.caption(f"→ ${ti_sf:.2f}/SF")
-            else:
-                ti_sf = st.number_input("TI Allowance ($/SF)", min_value=0.0, max_value=500.0, step=0.01, format="%.2f", key=f"ti{i}")
+                # TI Allowance Subsection
+                st.markdown("##### TI Allowance")
+                ti_fx = st.checkbox("Fixed TI Allowance (total $)", key=f"tifx{i}")
+                if ti_fx:
+                    tot = st.number_input("TI Allowance (total $)", min_value=0.0, max_value=10000000.0, step=0.01, format="%.2f", key=f"titot{i}")
+                    ti_sf = tot/(initial_sqft or 1)
+                    if initial_sqft > 0:
+                        st.caption(f"→ ${ti_sf:.2f}/SF")
+                else:
+                    ti_sf = st.number_input("TI Allowance ($/SF)", min_value=0.0, max_value=500.0, step=0.01, format="%.2f", key=f"ti{i}")
 
-            # Additional Credits Subsection
-            st.markdown("##### Additional Credits")
-            ac_fx = st.checkbox("Fixed Additional Credits (total $)", key=f"acfx{i}")
-            if ac_fx:
-                ac_tot = st.number_input("Additional Credits (total $)", min_value=0.0, max_value=10000000.0, step=0.01, format="%.2f", key=f"ac_tot{i}")
-                add_cred = ac_tot/(initial_sqft or 1)
-                if initial_sqft > 0:
-                    st.caption(f"→ ${add_cred:.2f}/SF")
-            else:
-                add_cred = st.number_input("Additional Credits ($/SF)", min_value=0.0, max_value=500.0, step=0.01, format="%.2f", key=f"ac{i}")
+                # Additional Credits Subsection
+                st.markdown("##### Additional Credits")
+                ac_fx = st.checkbox("Fixed Additional Credits (total $)", key=f"acfx{i}")
+                if ac_fx:
+                    ac_tot = st.number_input("Additional Credits (total $)", min_value=0.0, max_value=10000000.0, step=0.01, format="%.2f", key=f"ac_tot{i}")
+                    add_cred = ac_tot/(initial_sqft or 1)
+                    if initial_sqft > 0:
+                        st.caption(f"→ ${add_cred:.2f}/SF")
+                else:
+                    add_cred = st.number_input("Additional Credits ($/SF)", min_value=0.0, max_value=500.0, step=0.01, format="%.2f", key=f"ac{i}")
 
-            st.markdown("---")
+                st.markdown("---")
 
-            # Financial Parameters
-            st.markdown("#### Financial Parameters")
-            disc_pct = st.number_input("Discount Rate (%)", min_value=0.0, max_value=100.0, step=0.01, format="%.2f", key=f"dr{i}")
-            
-            # Commission Parameters (Internal Use)
-            st.markdown("#### Commission (Internal)")
-            st.caption("Internal use only - not shown in client-facing outputs")
-            comm_pct = st.number_input("Commission Rate (%)", min_value=0.0, max_value=100.0, step=0.01, format="%.2f", key=f"cm{i}")
-            include_opex = st.checkbox("Include OpEx in Commission Calculation", key=f"io{i}")
+                # Financial Parameters
+                st.markdown("#### Financial Parameters")
+                disc_pct = st.number_input("Discount Rate (%)", min_value=0.0, max_value=100.0, step=0.01, format="%.2f", key=f"dr{i}")
+                
+                # Commission Parameters (Internal Use)
+                st.markdown("#### Commission (Internal)")
+                st.caption("Internal use only - not shown in client-facing outputs")
+                comm_pct = st.number_input("Commission Rate (%)", min_value=0.0, max_value=100.0, step=0.01, format="%.2f", key=f"cm{i}")
+                include_opex = st.checkbox("Include OpEx in Commission Calculation", key=f"io{i}")
 
-            inputs.append({
-                "name":          name,
-                "start_date":    start_dt,
-                "term_mos":      term_mos,
-                "sqft":          initial_sqft,
-                "exp_month":     change_month,
-                "exp_sqft":      change_sqft,
-                "total_sqft":    total_sqft,
-                "base":          base,
-                "inc":           inc if not custom_inc else None,
-                "rent_incs":     rent_incs,
-                "lease_type":    lease_type,
-                "opex_base":     opex_base,
-                "opex":          opex,
-                "opexinc":       opexinc,
-                "park_cost":     park_cost,
-                "park_spaces":   park_spaces,
-                "park_detail":   park_detail,
-                "move_exp":      mv_sf,
-                "construction":  const_sf,
-                "ffe":           ffe_sf,
-                "free":          free_mo,
-                "ti":            ti_sf,
-                "add_cred":      add_cred,
-                "disc":          disc_pct,
-                "custom_abate":  cust_ab,
-                "abates":        abates,
-                "inside_term":   inside_term,
-                "base_only_abate": base_only if lease_type == "Triple Net (NNN)" else False,
-                "commission":    comm_pct,
-                "include_opex":  include_opex,
-            })
+                inputs.append({
+                    "name":          name,
+                    "start_date":    start_dt,
+                    "term_mos":      term_mos,
+                    "sqft":          initial_sqft,
+                    "exp_month":     change_month,
+                    "exp_sqft":      change_sqft,
+                    "total_sqft":    total_sqft,
+                    "base":          base,
+                    "inc":           inc if not custom_inc else None,
+                    "rent_incs":     rent_incs,
+                    "lease_type":    lease_type,
+                    "opex_base":     opex_base,
+                    "opex":          opex,
+                    "opexinc":       opexinc,
+                    "park_cost":     park_cost,
+                    "park_spaces":   park_spaces,
+                    "park_detail":   park_detail,
+                    "move_exp":      mv_sf,
+                    "construction":  const_sf,
+                    "ffe":           ffe_sf,
+                    "free":          free_mo,
+                    "ti":            ti_sf,
+                    "add_cred":      add_cred,
+                    "disc":          disc_pct,
+                    "custom_abate":  cust_ab,
+                    "abates":        abates,
+                    "inside_term":   inside_term,
+                    "base_only_abate": base_only if lease_type == "Triple Net (NNN)" else False,
+                    "commission":    comm_pct,
+                    "include_opex":  include_opex,
+                })
 
     # Run Analysis Button after inputs are created
     st.markdown("---")
@@ -806,502 +1273,645 @@ with tab_inputs:
 
 # ---- Analysis Tab ----
 with tab_analysis:
-    results = st.session_state.get("results", [])
-    if not results:
-        st.warning("Run analysis first in Inputs.")
-    else:
-        for idx, (p, s, wf) in enumerate(results):
-            st.header(f"Scenario {idx+1}: {s['Option']}")
-
-            # Lease Summary Section
-            st.markdown("### Lease Summary")
-            
-            # Create a container for the summary
-            with st.container():
-                col1, col2 = st.columns([2, 1])
+    if mode == "🏠 Buy Analyzer":
+        # Purchase Analysis
+        buy_results = st.session_state.get("buy_results", [])
+        if not buy_results:
+            st.warning("Run purchase analysis first in Inputs.")
+        else:
+            for idx, (buy_params, summary, waterfall) in enumerate(buy_results):
+                st.header(f"Purchase Scenario {idx+1}: {buy_params['name']}")
+                
+                # Display summary metrics
+                st.markdown("### Purchase Summary")
+                
+                col1, col2, col3 = st.columns(3)
                 
                 with col1:
-                    # Lease Term Section
-                    with st.container():
-                        st.markdown("#### Lease Term")
-                        
-                        # Get abatement details
-                        abate_details = ""
-                        if p.get("custom_abate") and p.get("abates"):
-                            # For custom abatement, show which years have abatement
-                            abate_years = [f"Year {i+1}: {months}mo" 
-                                         for i, months in enumerate(p.get("abates")) 
-                                         if months > 0]
-                            if abate_years:
-                                abate_details = f" ({', '.join(abate_years)})"
-                        elif p.get("free", 0) > 0:
-                            # For standard abatement, it's always in Year 1
-                            abate_details = " (Year 1)"
-                        
-                        # Calculate total abatement
-                        total_abate = sum(p.get("abates", [])) if p.get("custom_abate") else p.get("free", 0)
-                        
-                        # Determine abatement type label
-                        if total_abate > 0:
-                            if p.get("lease_type") == "Triple Net (NNN)":
-                                if p.get("base_only_abate"):
-                                    abate_type = "Base Rent Only"
-                                else:
-                                    abate_type = "Base Rent & OpEx"
-                                abate_text = f"{total_abate} months{abate_details} ({abate_type})"
-                            else:
-                                abate_text = f"{total_abate} months{abate_details}"
-                        else:
-                            abate_text = "None"
-                        
-                        lease_term_df = pd.DataFrame([
-                            ["Commencement", p.get("start_date", "").strftime("%m/%d/%Y") if p.get("start_date") else ""],
-                            ["Base Term", f"{p.get('term_mos', '')} months"],
-                            ["Months Abated", abate_text],
-                            ["Total Term", f"{s.get('Total Term (mos)', '')} months"],
-                            ["Expiration", (p.get("start_date") + relativedelta(months=s.get("Total Term (mos)", 0))).strftime("%m/%d/%Y") if p.get("start_date") else ""]
-                        ], columns=['Label', 'Value'])
-                        
-                        styled_lease_term_df = lease_term_df.style\
-                            .set_properties(**{'text-align': 'left'})\
-                            .hide(axis=0)\
-                            .hide(axis=1)
-                        
-                        st.dataframe(styled_lease_term_df, hide_index=True)
-                    
-                    # Square Footage Section
-                    with st.container():
-                        st.markdown("#### Square Footage")
-                        # Calculate which year the change occurs in
-                        if p.get('exp_month', 0) > 0:
-                            change_year = (p.get('exp_month', 0) - 1) // 12 + 1
-                            size_change_text = f"{p.get('exp_sqft', 0):+,} (Year {change_year})"
-                        else:
-                            size_change_text = "-"
-                            
-                        square_footage_df = pd.DataFrame([
-                            ["Initial SF", f"{p.get('sqft', ''):,}"],
-                            ["Size Change", size_change_text],
-                            ["Total SF", f"{p.get('total_sqft', ''):,}"]
-                        ], columns=['Label', 'Value'])
-                        
-                        styled_square_footage_df = square_footage_df.style\
-                            .set_properties(**{'text-align': 'left'})\
-                            .hide(axis=0)\
-                            .hide(axis=1)
-                        
-                        st.dataframe(styled_square_footage_df, hide_index=True)
-                    
-                    # Capital Costs Section
-                    with st.container():
-                        st.markdown("#### Capital Costs")
-                        construction_balance = p.get('construction', 0) - p.get('ti', 0)
-                        balance_color = "red" if construction_balance > 0 else "green"
-                        
-                        # Create DataFrame for capital costs
-                        capital_costs_df = pd.DataFrame([
-                            ["Total Construction Cost", f"${p.get('construction', 0):,.2f} /SF"],
-                            ["TI Allowance", f"${p.get('ti', 0):,.2f} /SF"],
-                            ["Construction Cost Balance", f"${construction_balance:,.2f} /SF"],
-                            ["Moving Cost", f"${p.get('move_exp', 0):,.2f} /SF"],
-                            ["FF&E", f"${p.get('ffe', 0):,.2f} /SF"]
-                        ], columns=['Label', 'Value'])
-                        
-                        # Apply styling
-                        def style_df(df):
-                            return pd.DataFrame(
-                                [[''] * len(df.columns) if 'Construction Cost Balance' not in row['Label'] 
-                                 else ['', f'color: {balance_color}'] for _, row in df.iterrows()],
-                                index=df.index, columns=df.columns
-                            )
-                        
-                        styled_df = capital_costs_df.style\
-                            .set_properties(**{'text-align': 'left'})\
-                            .apply(style_df, axis=None)\
-                            .hide(axis=0)\
-                            .hide(axis=1)
-                        
-                        st.dataframe(styled_df, hide_index=True)
-                        st.caption("Note: A positive Construction Cost Balance (red) means additional tenant cost; negative (green) means tenant credit.")
+                    st.markdown("#### Property Details")
+                    st.metric("Purchase Price", summary["Purchase Price"])
+                    st.metric("Down Payment", summary["Down Payment"])
+                    st.metric("Loan Amount", summary["Loan Amount"])
+                    st.metric("Monthly Payment", summary["Monthly Payment"])
                 
                 with col2:
-                    # Base Rent Section
-                    with st.container():
-                        st.markdown("#### Base Rent")
-                        base_rent_df = pd.DataFrame([
-                            ["Base Rent", f"${p.get('base', 0):,.2f}"],
-                            ["Type", p.get('lease_type', '')],
-                            ["Escalation", f"{p.get('inc', 0)}%"]
-                        ], columns=['Label', 'Value'])
-                        styled_base_df = base_rent_df.style\
-                            .set_properties(**{'text-align': 'left'})\
-                            .hide(axis=0)\
-                            .hide(axis=1)
-                        st.dataframe(styled_base_df, hide_index=True)
-                    
-                    # Operating Expenses Section
-                    with st.container():
-                        st.markdown("#### Operating Expenses")
-                        operating_expenses_df = pd.DataFrame([
-                            ["OpEx Base Year", f"${p.get('opex', 0):,.2f}"],
-                            ["Escalation", f"{p.get('opexinc', 0)}%"]
-                        ], columns=['Label', 'Value'])
-                        styled_opex_df = operating_expenses_df.style\
-                            .set_properties(**{'text-align': 'left'})\
-                            .hide(axis=0)\
-                            .hide(axis=1)
-                        st.dataframe(styled_opex_df, hide_index=True)
-                        st.caption("*Estimated OpEx escalation")
-                    
-                    # Parking Section
-                    with st.container():
-                        st.markdown("#### Parking")
-                        
-                        # Create parking table with clean layout
-                        parking_df = pd.DataFrame([
-                            ["Ratio/1,000 SF", f"{p.get('park_spaces', 0)/(p.get('sqft', 1))*1000 if p.get('sqft', 1) else 0:.2f}"],
-                            ["Unreserved Spaces", str(p.get('park_detail', {}).get('unres_spaces', 0))],
-                            ["Unreserved Rate", f"${p.get('park_detail', {}).get('unres_cost', 0):,.2f}"],
-                            ["Reserved Spaces", str(p.get('park_detail', {}).get('res_spaces', 0))],
-                            ["Reserved Rate", f"${p.get('park_detail', {}).get('res_cost', 0):,.2f}"],
-                            ["Escalation", f"{p.get('park_detail', {}).get('park_inc', 0)}%"]
-                        ], columns=['Label', 'Value'])
-                        
-                        styled_parking_df = parking_df.style\
-                            .set_properties(**{'text-align': 'left'})\
-                            .hide(axis=0)\
-                            .hide(axis=1)
-                        
-                        st.dataframe(styled_parking_df, hide_index=True)
-                        
-                        # Show escalation caption
-                        st.caption("*Estimated parking escalation")
-
-            st.divider()
-
-            # Primary Financial Metrics
-            st.markdown("### Primary Financial Metrics")
-            
-            k1, k2, k3 = st.columns(3)
-            with k1:
-                st.markdown("#### Total Rent Obligation")
-                st.markdown(f'<div class="metric-value">{s["Total Cost"]}</div>', unsafe_allow_html=True)
-                st.caption("(Excluding parking, including construction cost balance and additional credits)")
-            
-            with k2:
-                st.markdown("#### Avg Eff. Rent")
-                st.markdown(f'<div class="metric-value">{s["Avg Eff. Rent"]}</div>', unsafe_allow_html=True)
-                st.caption("Average effective rent per SF per year")
-            
-            with k3:
-                npv_key = next(k for k in s if k.startswith("NPV"))
-                st.markdown(f"#### {npv_key}")
-                st.markdown(f'<div class="metric-value">{s[npv_key]}</div>', unsafe_allow_html=True)
-                st.caption("Present value of all lease payments and concessions using the given discount rate, excluding parking costs")
-
-            st.divider()
-
-            # Second row of metrics (without title)
-            k4, k5, k6 = st.columns(3)
-            with k4:
-                st.markdown("#### Moving Cost")
-                st.markdown(f'<div class="metric-value">${p.get("move_exp", 0)*initial_sqft:,.0f}</div>', unsafe_allow_html=True)
-                st.caption("Total moving cost")
-            
-            with k5:
-                st.markdown("#### FF&E")
-                st.markdown(f'<div class="metric-value">${p.get("ffe", 0)*initial_sqft:,.0f}</div>', unsafe_allow_html=True)
-                st.caption("Total FF&E cost")
-            
-            with k6:
-                st.markdown("#### Additional Credit")
-                st.markdown(f'<div class="metric-value">{s["Additional Credit"]}</div>', unsafe_allow_html=True)
-                st.caption("Other landlord incentives")
-
-            st.divider()
-
-            # Third row of metrics (without title)
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                st.markdown("#### Construction Cost")
-                st.markdown(f'<div class="metric-value">{s["Construction Cost"]}</div>', unsafe_allow_html=True)
-                st.caption("Total construction cost")
-            
-            with c2:
-                st.markdown("#### TI Allowance")
-                st.markdown(f'<div class="metric-value">{s["TI Allowance"]}</div>', unsafe_allow_html=True)
-                st.caption("Total tenant improvement allowance")
-            
-            with c3:
-                def parse_currency(val):
-                    return float(str(val).replace('$', '').replace(',', '').replace(' ', ''))
-                tenant_expense = parse_currency(s["Construction Cost"]) - parse_currency(s["TI Allowance"])
-                expense_color = "red" if tenant_expense > 0 else "green"
-                st.markdown("#### Construction Cost Balance")
-                st.markdown(f'<div class="metric-value" style="color: {expense_color}">${tenant_expense:,.0f}</div>', unsafe_allow_html=True)
-                st.caption("Red: additional tenant cost; green: tenant credit")
-
-            st.divider()
-
-            # Annual Cost Breakdown Chart
-            st.markdown("### Annual Cost Breakdown")
-            
-            # Chart without header
-            cost_fig = go.Figure()
-            for name in ["Base Rent", "Opex", "Parking Exp"]:
-                if name in wf.columns:
-                    cost_fig.add_trace(go.Bar(
-                        name=name,
-                        x=wf["Year"],
-                        y=wf[name],
-                    ))
-            cost_fig.update_layout(
-                barmode="stack",
-                xaxis_title="Year",
-                yaxis_title="Cost ($)",
-                margin=dict(t=30, b=30, l=50, r=30),
-                legend_title_text="",
-                hovermode="x unified",
-                template="plotly_white",
-                showlegend=True,
-                legend=dict(
-                    orientation="h",
-                    yanchor="bottom",
-                    y=1.02,
-                    xanchor="center",
-                    x=0.5
+                    st.markdown("#### Financial Metrics")
+                    st.metric("Total Cost", summary["Total Cost"])
+                    st.metric("NPV", summary["NPV"])
+                    st.metric("Final Property Value", summary["Final Property Value"])
+                    st.metric("Equity", summary["Equity"])
+                
+                with col3:
+                    st.markdown("#### Investment Analysis")
+                    st.metric("Net Position", summary["Net Position"])
+                    st.metric("IRR", summary["IRR"])
+                    st.metric("Analysis Period", summary["Analysis Period"])
+                
+                # Cash flow chart
+                st.markdown("### Annual Cash Flow")
+                
+                years = list(range(1, buy_params['analysis_period'] + 1))
+                cash_flows = [-float(row['Total Cost'].replace('$', '').replace(',', '')) for row in waterfall.to_dict('records')]
+                
+                fig = go.Figure()
+                fig.add_trace(go.Bar(
+                    x=years,
+                    y=cash_flows,
+                    name='Annual Cost',
+                    marker_color='red'
+                ))
+                
+                fig.update_layout(
+                    title="Annual Property Costs",
+                    xaxis_title="Year",
+                    yaxis_title="Cost ($)",
+                    template="plotly_white"
                 )
-            )
-            st.plotly_chart(cost_fig, use_container_width=True)
+                
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Cash flow table
+                st.markdown("### Detailed Cash Flow")
+                st.dataframe(waterfall, use_container_width=True)
+                
+                st.markdown("---")
+    else:
+        # Original lease analysis
+        results = st.session_state.get("results", [])
+        if not results:
+            st.warning("Run analysis first in Inputs.")
+        else:
+            for idx, (p, s, wf) in enumerate(results):
+                st.header(f"Scenario {idx+1}: {s['Option']}")
 
-            # Rent Schedule
-            st.markdown("### Rent Schedule")
-            
-            # Create the rent schedule DataFrame (not transposed)
-            rent_schedule = pd.DataFrame({
-                "Period": wf["Period"].tolist(),
-                "SF": wf["SF"].tolist(),
-                # Base Rent and OpEx as PSF - divide total by SF
-                "Base Rent PSF": [base / float(rsf.replace(',', '')) 
-                                  for base, rsf in zip(wf["Base Rent"].tolist(), wf["SF"].tolist())],
-                "OpEx PSF": [opex / float(rsf.replace(',', '')) 
-                             for opex, rsf in zip(wf["Opex"].tolist(), wf["SF"].tolist())],
-                # Total costs for other columns
-                "Gross Rent": [base + opex for base, opex in zip(wf["Base Rent"].tolist(), wf["Opex"].tolist())],
-                "Rent Abatement": wf["Rent Abatement"].tolist() if "Rent Abatement" in wf.columns else [0] * len(wf),
-            })
-
-            # Add Net Rent column
-            rent_schedule["Net Rent"] = rent_schedule["Gross Rent"] + rent_schedule["Rent Abatement"]
-
-            # Calculate full years and extra months
-            full_years = p["term_mos"] // 12
-            extra_mos = p["term_mos"] % 12
-
-            # Create Year and Months columns
-            year_labels = [f"Year {i+1}" for i in range(len(wf))]
-            month_values = [12 if i < len(wf)-1 else (extra_mos if extra_mos > 0 else 12) for i in range(len(wf))]
-            
-            # Add Year and Months columns at the start
-            rent_schedule.insert(0, "Year", year_labels)
-            rent_schedule.insert(1, "Months", month_values)
-
-            # Format currency columns
-            psf_columns = ["Base Rent PSF", "OpEx PSF"]
-            total_columns = ["Gross Rent", "Rent Abatement", "Net Rent"]
-
-            # Format PSF columns
-            for col in psf_columns:
-                rent_schedule[col] = rent_schedule[col].apply(lambda x: f"${x:,.2f}")
-
-            # Format total cost columns
-            for col in total_columns:
-                rent_schedule[col] = rent_schedule[col].apply(lambda x: f"${abs(x):,.0f}" if col != "Rent Abatement" else f"${x:,.0f}")
-
-            # Create the style
-            styled_schedule = rent_schedule.style
-
-            # Apply base styling
-            styled_schedule = styled_schedule.set_properties(**{
-                'text-align': 'center',
-                'padding': '8px',
-                'white-space': 'nowrap'
-            })
-
-            # Apply specific column styles
-            styled_schedule = styled_schedule.set_properties(**{
-                'color': 'green'
-            }, subset=['Rent Abatement'])
-
-            styled_schedule = styled_schedule.set_properties(**{
-                'background-color': '#FFEB9C'
-            }, subset=['Net Rent'])
-
-            # Style the first four columns
-            styled_schedule = styled_schedule.set_properties(**{
-                'color': '#666666',
-                'font-size': '0.95em'
-            }, subset=pd.IndexSlice[:, ['Year', 'Months', 'Period', 'SF']])
-
-            # Add table styles
-            styled_schedule = styled_schedule.set_table_styles([
-                # Style for column headers
-                {'selector': 'th', 'props': [
-                    ('text-align', 'center'),
-                    ('font-weight', 'bold'),
-                    ('padding', '8px'),
-                    ('white-space', 'nowrap'),
-                    ('background-color', '#f8f9fa')
-                ]},
-                # Add borders between sections
-                {'selector': 'td:nth-child(6)', 'props': [  # After OpEx (adjusted for new Months column)
-                    ('border-right', '2px solid #e0e0e0')
-                ]},
-                {'selector': 'td:nth-child(8)', 'props': [  # After Gross Rent (adjusted for new Months column)
-                    ('border-right', '2px solid #e0e0e0')
-                ]},
-                {'selector': 'th:nth-child(6)', 'props': [  # Header after OpEx (adjusted for new Months column)
-                    ('border-right', '2px solid #e0e0e0')
-                ]},
-                {'selector': 'th:nth-child(8)', 'props': [  # Header after Gross Rent (adjusted for new Months column)
-                    ('border-right', '2px solid #e0e0e0')
-                ]}
-            ])
-
-            st.dataframe(styled_schedule, use_container_width=True)
-
-            # Commission Section (Internal Only)
-            if s["Commission Rate"] > 0:
-                with st.expander("💰 Commission Details (Internal)", expanded=False):
-                    st.markdown("#### Commission Calculation")
-                    col1, col2 = st.columns(2)
+                # Lease Summary Section
+                st.markdown("### Lease Summary")
+                
+                # Create a container for the summary
+                with st.container():
+                    col1, col2 = st.columns([2, 1])
                     
                     with col1:
-                        st.metric(
-                            "Commission Amount",
-                            f"${s['Commission Amount']:,.2f}",
-                            help="Total commission based on selected rate and base"
-                        )
-                        st.caption(f"Rate: {s['Commission Rate']}%")
-                    
-                    with col2:
-                        st.metric(
-                            "Commission Base",
-                            f"${s['Commission Base']:,.2f}",
-                            help="Total amount commission is calculated on"
-                        )
-                        st.caption(f"Including OpEx: {'Yes' if s['Include OpEx'] else 'No'}")
-                    
-                    st.markdown("---")
-                    st.markdown("##### Calculation Details")
-                    st.markdown("""
-                    - Base: {'Base Rent + OpEx' if s['Include OpEx'] else 'Base Rent Only'}
-                    - Excludes: Abatement Months
-                    - Calculation: Commission Base × Rate%
-                    """)
+                        # Lease Term Section
+                        with st.container():
+                            st.markdown("#### Lease Term")
+                            
+                            # Get abatement details
+                            abate_details = ""
+                            if p.get("custom_abate") and p.get("abates"):
+                                # For custom abatement, show which years have abatement
+                                abate_years = [f"Year {i+1}: {months}mo" 
+                                             for i, months in enumerate(p.get("abates")) 
+                                             if months > 0]
+                                if abate_years:
+                                    abate_details = f" ({', '.join(abate_years)})"
+                                elif p.get("free", 0) > 0:
+                                    # For standard abatement, it's always in Year 1
+                                    abate_details = " (Year 1)"
+                                
+                                # Calculate total abatement
+                                total_abate = sum(p.get("abates", [])) if p.get("custom_abate") else p.get("free", 0)
+                                
+                                # Determine abatement type label
+                                if total_abate > 0:
+                                    if p.get("lease_type") == "Triple Net (NNN)":
+                                        if p.get("base_only_abate"):
+                                            abate_type = "Base Rent Only"
+                                        else:
+                                            abate_type = "Base Rent & OpEx"
+                                        abate_text = f"{total_abate} months{abate_details} ({abate_type})"
+                                    else:
+                                        abate_text = f"{total_abate} months{abate_details}"
+                                else:
+                                    abate_text = "None"
+                                
+                                lease_term_df = pd.DataFrame([
+                                    ["Commencement", p.get("start_date", "").strftime("%m/%d/%Y") if p.get("start_date") else ""],
+                                    ["Base Term", f"{p.get('term_mos', '')} months"],
+                                    ["Months Abated", abate_text],
+                                    ["Total Term", f"{s.get('Total Term (mos)', '')} months"],
+                                    ["Expiration", (p.get("start_date") + relativedelta(months=s.get("Total Term (mos)", 0))).strftime("%m/%d/%Y") if p.get("start_date") else ""]
+                                ], columns=['Label', 'Value'])
+                                
+                                styled_lease_term_df = lease_term_df.style\
+                                    .set_properties(**{'text-align': 'left'})\
+                                    .hide(axis=0)\
+                                    .hide(axis=1)
+                                
+                                st.dataframe(styled_lease_term_df, hide_index=True)
+                            
+                            # Square Footage Section
+                            with st.container():
+                                st.markdown("#### Square Footage")
+                                # Calculate which year the change occurs in
+                                if p.get('exp_month', 0) > 0:
+                                    change_year = (p.get('exp_month', 0) - 1) // 12 + 1
+                                    size_change_text = f"{p.get('exp_sqft', 0):+,} (Year {change_year})"
+                                else:
+                                    size_change_text = "-"
+                                    
+                                square_footage_df = pd.DataFrame([
+                                    ["Initial SF", f"{p.get('sqft', ''):,}"],
+                                    ["Size Change", size_change_text],
+                                    ["Total SF", f"{p.get('total_sqft', ''):,}"]
+                                ], columns=['Label', 'Value'])
+                                
+                                styled_square_footage_df = square_footage_df.style\
+                                    .set_properties(**{'text-align': 'left'})\
+                                    .hide(axis=0)\
+                                    .hide(axis=1)
+                                
+                                st.dataframe(styled_square_footage_df, hide_index=True)
+                            
+                            # Capital Costs Section
+                            with st.container():
+                                st.markdown("#### Capital Costs")
+                                construction_balance = p.get('construction', 0) - p.get('ti', 0)
+                                balance_color = "red" if construction_balance > 0 else "green"
+                                
+                                # Create DataFrame for capital costs
+                                capital_costs_df = pd.DataFrame([
+                                    ["Total Construction Cost", f"${p.get('construction', 0):,.2f} /SF"],
+                                    ["TI Allowance", f"${p.get('ti', 0):,.2f} /SF"],
+                                    ["Construction Cost Balance", f"${construction_balance:,.2f} /SF"],
+                                    ["Moving Cost", f"${p.get('move_exp', 0):,.2f} /SF"],
+                                    ["FF&E", f"${p.get('ffe', 0):,.2f} /SF"]
+                                ], columns=['Label', 'Value'])
+                                
+                                # Apply styling
+                                def style_df(df):
+                                    return pd.DataFrame(
+                                        [[''] * len(df.columns) if 'Construction Cost Balance' not in row['Label'] 
+                                         else ['', f'color: {balance_color}'] for _, row in df.iterrows()],
+                                        index=df.index, columns=df.columns
+                                    )
+                                
+                                styled_df = capital_costs_df.style\
+                                    .set_properties(**{'text-align': 'left'})\
+                                    .apply(style_df, axis=None)\
+                                    .hide(axis=0)\
+                                    .hide(axis=1)
+                                
+                                st.dataframe(styled_df, hide_index=True)
+                                st.caption("Note: A positive Construction Cost Balance (red) means additional tenant cost; negative (green) means tenant credit.")
+                        
+                        with col2:
+                            # Base Rent Section
+                            with st.container():
+                                st.markdown("#### Base Rent")
+                                base_rent_df = pd.DataFrame([
+                                    ["Base Rent", f"${p.get('base', 0):,.2f}"],
+                                    ["Type", p.get('lease_type', '')],
+                                    ["Escalation", f"{p.get('inc', 0)}%"]
+                                ], columns=['Label', 'Value'])
+                                styled_base_df = base_rent_df.style\
+                                    .set_properties(**{'text-align': 'left'})\
+                                    .hide(axis=0)\
+                                    .hide(axis=1)
+                                st.dataframe(styled_base_df, hide_index=True)
+                            
+                            # Operating Expenses Section
+                            with st.container():
+                                st.markdown("#### Operating Expenses")
+                                operating_expenses_df = pd.DataFrame([
+                                    ["OpEx Base Year", f"${p.get('opex', 0):,.2f}"],
+                                    ["Escalation", f"{p.get('opexinc', 0)}%"]
+                                ], columns=['Label', 'Value'])
+                                styled_opex_df = operating_expenses_df.style\
+                                    .set_properties(**{'text-align': 'left'})\
+                                    .hide(axis=0)\
+                                    .hide(axis=1)
+                                st.dataframe(styled_opex_df, hide_index=True)
+                                st.caption("*Estimated OpEx escalation")
+                            
+                            # Parking Section
+                            with st.container():
+                                st.markdown("#### Parking")
+                                
+                                # Create parking table with clean layout
+                                parking_df = pd.DataFrame([
+                                    ["Ratio/1,000 SF", f"{p.get('park_spaces', 0)/(p.get('sqft', 1))*1000 if p.get('sqft', 1) else 0:.2f}"],
+                                    ["Unreserved Spaces", str(p.get('park_detail', {}).get('unres_spaces', 0))],
+                                    ["Unreserved Rate", f"${p.get('park_detail', {}).get('unres_cost', 0):,.2f}"],
+                                    ["Reserved Spaces", str(p.get('park_detail', {}).get('res_spaces', 0))],
+                                    ["Reserved Rate", f"${p.get('park_detail', {}).get('res_cost', 0):,.2f}"],
+                                    ["Escalation", f"{p.get('park_detail', {}).get('park_inc', 0)}%"]
+                                ], columns=['Label', 'Value'])
+                                
+                                styled_parking_df = parking_df.style\
+                                    .set_properties(**{'text-align': 'left'})\
+                                    .hide(axis=0)\
+                                    .hide(axis=1)
+                                
+                                st.dataframe(styled_parking_df, hide_index=True)
+                                
+                                # Show escalation caption
+                                st.caption("*Estimated parking escalation")
 
-            st.markdown("<p style='font-size: 0.8em; color: gray;'>© 2025 Savills. All rights reserved.</p>", unsafe_allow_html=True)
+                st.divider()
+
+                # Primary Financial Metrics
+                st.markdown("### Primary Financial Metrics")
+                
+                k1, k2, k3 = st.columns(3)
+                with k1:
+                    st.markdown("#### Total Rent Obligation")
+                    st.markdown(f'<div class="metric-value">{s["Total Cost"]}</div>', unsafe_allow_html=True)
+                    st.caption("(Excluding parking, including construction cost balance and additional credits)")
+                
+                with k2:
+                    st.markdown("#### Avg Eff. Rent")
+                    st.markdown(f'<div class="metric-value">{s["Avg Eff. Rent"]}</div>', unsafe_allow_html=True)
+                    st.caption("Average effective rent per SF per year")
+                
+                with k3:
+                    npv_key = next(k for k in s if k.startswith("NPV"))
+                    st.markdown(f"#### {npv_key}")
+                    st.markdown(f'<div class="metric-value">{s[npv_key]}</div>', unsafe_allow_html=True)
+                    st.caption("Present value of all lease payments and concessions using the given discount rate, excluding parking costs")
+
+                st.divider()
+
+                # Second row of metrics (without title)
+                k4, k5, k6 = st.columns(3)
+                with k4:
+                    st.markdown("#### Moving Cost")
+                    st.markdown(f'<div class="metric-value">${p.get("move_exp", 0)*initial_sqft:,.0f}</div>', unsafe_allow_html=True)
+                    st.caption("Total moving cost")
+                
+                with k5:
+                    st.markdown("#### FF&E")
+                    st.markdown(f'<div class="metric-value">${p.get("ffe", 0)*initial_sqft:,.0f}</div>', unsafe_allow_html=True)
+                    st.caption("Total FF&E cost")
+                
+                with k6:
+                    st.markdown("#### Additional Credit")
+                    st.markdown(f'<div class="metric-value">{s["Additional Credit"]}</div>', unsafe_allow_html=True)
+                    st.caption("Other landlord incentives")
+
+                st.divider()
+
+                # Third row of metrics (without title)
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    st.markdown("#### Construction Cost")
+                    st.markdown(f'<div class="metric-value">{s["Construction Cost"]}</div>', unsafe_allow_html=True)
+                    st.caption("Total construction cost")
+                
+                with c2:
+                    st.markdown("#### TI Allowance")
+                    st.markdown(f'<div class="metric-value">{s["TI Allowance"]}</div>', unsafe_allow_html=True)
+                    st.caption("Total tenant improvement allowance")
+                
+                with c3:
+                    def parse_currency(val):
+                        return float(str(val).replace('$', '').replace(',', '').replace(' ', ''))
+                    tenant_expense = parse_currency(s["Construction Cost"]) - parse_currency(s["TI Allowance"])
+                    expense_color = "red" if tenant_expense > 0 else "green"
+                    st.markdown("#### Construction Cost Balance")
+                    st.markdown(f'<div class="metric-value" style="color: {expense_color}">${tenant_expense:,.0f}</div>', unsafe_allow_html=True)
+                    st.caption("Red: additional tenant cost; green: tenant credit")
+
+                st.divider()
+
+                # Annual Cost Breakdown Chart
+                st.markdown("### Annual Cost Breakdown")
+                
+                # Chart without header
+                cost_fig = go.Figure()
+                for name in ["Base Rent", "Opex", "Parking Exp"]:
+                    if name in wf.columns:
+                        cost_fig.add_trace(go.Bar(
+                            name=name,
+                            x=wf["Year"],
+                            y=wf[name],
+                        ))
+                cost_fig.update_layout(
+                    barmode="stack",
+                    xaxis_title="Year",
+                    yaxis_title="Cost ($)",
+                    margin=dict(t=30, b=30, l=50, r=30),
+                    legend_title_text="",
+                    hovermode="x unified",
+                    template="plotly_white",
+                    showlegend=True,
+                    legend=dict(
+                        orientation="h",
+                        yanchor="bottom",
+                        y=1.02,
+                        xanchor="center",
+                        x=0.5
+                    )
+                )
+                st.plotly_chart(cost_fig, use_container_width=True)
+
+                # Rent Schedule
+                st.markdown("### Rent Schedule")
+                
+                # Create the rent schedule DataFrame (not transposed)
+                rent_schedule = pd.DataFrame({
+                    "Period": wf["Period"].tolist(),
+                    "SF": wf["SF"].tolist(),
+                    # Base Rent and OpEx as PSF - divide total by SF
+                    "Base Rent PSF": [base / float(rsf.replace(',', '')) 
+                                      for base, rsf in zip(wf["Base Rent"].tolist(), wf["SF"].tolist())],
+                    "OpEx PSF": [opex / float(rsf.replace(',', '')) 
+                                 for opex, rsf in zip(wf["Opex"].tolist(), wf["SF"].tolist())],
+                    # Total costs for other columns
+                    "Gross Rent": [base + opex for base, opex in zip(wf["Base Rent"].tolist(), wf["Opex"].tolist())],
+                    "Rent Abatement": wf["Rent Abatement"].tolist() if "Rent Abatement" in wf.columns else [0] * len(wf),
+                })
+
+                # Add Net Rent column
+                rent_schedule["Net Rent"] = rent_schedule["Gross Rent"] + rent_schedule["Rent Abatement"]
+
+                # Calculate full years and extra months
+                full_years = p["term_mos"] // 12
+                extra_mos = p["term_mos"] % 12
+
+                # Create Year and Months columns
+                year_labels = [f"Year {i+1}" for i in range(len(wf))]
+                month_values = [12 if i < len(wf)-1 else (extra_mos if extra_mos > 0 else 12) for i in range(len(wf))]
+                
+                # Add Year and Months columns at the start
+                rent_schedule.insert(0, "Year", year_labels)
+                rent_schedule.insert(1, "Months", month_values)
+
+                # Format currency columns
+                psf_columns = ["Base Rent PSF", "OpEx PSF"]
+                total_columns = ["Gross Rent", "Rent Abatement", "Net Rent"]
+
+                # Format PSF columns
+                for col in psf_columns:
+                    rent_schedule[col] = rent_schedule[col].apply(lambda x: f"${x:,.2f}")
+
+                # Format total cost columns
+                for col in total_columns:
+                    rent_schedule[col] = rent_schedule[col].apply(lambda x: f"${abs(x):,.0f}" if col != "Rent Abatement" else f"${x:,.0f}")
+
+                # Create the style
+                styled_schedule = rent_schedule.style
+
+                # Apply base styling
+                styled_schedule = styled_schedule.set_properties(**{
+                    'text-align': 'center',
+                    'padding': '8px',
+                    'white-space': 'nowrap'
+                })
+
+                # Apply specific column styles
+                styled_schedule = styled_schedule.set_properties(**{
+                    'color': 'green'
+                }, subset=['Rent Abatement'])
+
+                styled_schedule = styled_schedule.set_properties(**{
+                    'background-color': '#FFEB9C'
+                }, subset=['Net Rent'])
+
+                # Style the first four columns
+                styled_schedule = styled_schedule.set_properties(**{
+                    'color': '#666666',
+                    'font-size': '0.95em'
+                }, subset=pd.IndexSlice[:, ['Year', 'Months', 'Period', 'SF']])
+
+                # Add table styles
+                styled_schedule = styled_schedule.set_table_styles([
+                    # Style for column headers
+                    {'selector': 'th', 'props': [
+                        ('text-align', 'center'),
+                        ('font-weight', 'bold'),
+                        ('padding', '8px'),
+                        ('white-space', 'nowrap'),
+                        ('background-color', '#f8f9fa')
+                    ]},
+                    # Add borders between sections
+                    {'selector': 'td:nth-child(6)', 'props': [  # After OpEx (adjusted for new Months column)
+                        ('border-right', '2px solid #e0e0e0')
+                    ]},
+                    {'selector': 'td:nth-child(8)', 'props': [  # After Gross Rent (adjusted for new Months column)
+                        ('border-right', '2px solid #e0e0e0')
+                    ]},
+                    {'selector': 'th:nth-child(6)', 'props': [  # Header after OpEx (adjusted for new Months column)
+                        ('border-right', '2px solid #e0e0e0')
+                    ]},
+                    {'selector': 'th:nth-child(8)', 'props': [  # Header after Gross Rent (adjusted for new Months column)
+                        ('border-right', '2px solid #e0e0e0')
+                    ]}
+                ])
+
+                st.dataframe(styled_schedule, use_container_width=True)
+
+                # Commission Section (Internal Only)
+                if s["Commission Rate"] > 0:
+                    with st.expander("💰 Commission Details (Internal)", expanded=False):
+                        st.markdown("#### Commission Calculation")
+                        col1, col2 = st.columns(2)
+                        
+                        with col1:
+                            st.metric(
+                                "Commission Amount",
+                                f"${s['Commission Amount']:,.2f}",
+                                help="Total commission based on selected rate and base"
+                            )
+                            st.caption(f"Rate: {s['Commission Rate']}%")
+                        
+                        with col2:
+                            st.metric(
+                                "Commission Base",
+                                f"${s['Commission Base']:,.2f}",
+                                help="Total amount commission is calculated on"
+                            )
+                            st.caption(f"Including OpEx: {'Yes' if s['Include OpEx'] else 'No'}")
+                        
+                        st.markdown("---")
+                        st.markdown("##### Calculation Details")
+                        st.markdown("""
+                        - Base: {'Base Rent + OpEx' if s['Include OpEx'] else 'Base Rent Only'}
+                        - Excludes: Abatement Months
+                        - Calculation: Commission Base × Rate%
+                        """)
+
+                st.markdown("<p style='font-size: 0.8em; color: gray;'>© 2025 Savills. All rights reserved.</p>", unsafe_allow_html=True)
 
 # ---- Comparison Tab ----
 with tab_comparison:
-    results = st.session_state.get("results", [])
-    if len(results) < 2:
-        st.info("Enable compare & run ≥2 scenarios.")
-    else:
-        # Build comparison DataFrame with Lease Type
-        df = pd.DataFrame([{
-            **r[1],  # summary
-            "Lease Type": r[0].get("lease_type", "")
-        } for r in results])
+    if mode == "🏠 Buy Analyzer":
+        # Purchase Comparison
+        buy_results = st.session_state.get("buy_results", [])
+        if len(buy_results) < 2:
+            st.info("Configure & run ≥2 purchase scenarios to compare.")
+        else:
+            # Build comparison DataFrame for purchases
+            df = pd.DataFrame([{
+                **r[1],  # summary
+                "Property Type": "Purchase"
+            } for r in buy_results])
 
-        st.markdown("## Comparison Summary")
-        st.dataframe(df, use_container_width=True)
+            st.markdown("## Purchase Comparison Summary")
+            st.dataframe(df, use_container_width=True)
 
-        # Excel export
-        if not df.empty:
-            excel_buf = io.BytesIO()
-            with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
-                df.to_excel(writer, sheet_name="Summary", index=False)
-            st.download_button("📥 Download Comparison Excel", excel_buf.getvalue(),
-                               file_name="comparison.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            # Excel export
+            if not df.empty:
+                excel_buf = io.BytesIO()
+                with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
+                    df.to_excel(writer, sheet_name="Summary", index=False)
+                st.download_button("📥 Download Purchase Comparison Excel", excel_buf.getvalue(),
+                                   file_name="purchase_comparison.xlsx",
+                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-            # PDF export
-            if st.button("📄 Generate PDF Summary"):
-                pdf = FPDF()
-                pdf.set_auto_page_break(auto=True, margin=15)
-                pdf.add_page()
-                
-                # Try to add logo to PDF using the asset path function
-                try:
-                    logo_path = get_asset_path("savills_logo.png")
-                    pdf.image(logo_path, x=10, y=10, w=40)
-                except Exception:
-                    # Continue without logo if not available
-                    pass
-                    
-                pdf.ln(20)  # space below the logo
-
-                pdf.set_font("Arial", 'B', 16)
-                pdf.cell(0, 10, "Lease Scenario Comparison Summary", ln=True)
-
-                pdf.set_font("Arial", '', 10)
-                col_width = pdf.w / (len(df.columns) + 1)
-                pdf.ln(5)
-                for col in df.columns:
-                    pdf.cell(col_width, 8, str(col), border=1)
-                pdf.ln()
-                for _, row in df.iterrows():
-                    for val in row:
-                        pdf.cell(col_width, 8, str(val), border=1)
-                    pdf.ln()
-
-                # Add individual scenario summaries
-                for idx, result in enumerate(results):
-                    p, s, wf = result
-
+                # PDF export
+                if st.button("📄 Generate Purchase PDF Summary"):
+                    pdf = FPDF()
+                    pdf.set_auto_page_break(auto=True, margin=15)
                     pdf.add_page()
-                    pdf.image("savills_logo.png", x=10, y=10, w=40)
+                    
+                    try:
+                        logo_path = get_asset_path("savills_logo.png")
+                        pdf.image(logo_path, x=10, y=10, w=40)
+                    except Exception:
+                        pass
+                        
+                    pdf.ln(20)
+
+                    pdf.set_font("Arial", 'B', 16)
+                    pdf.cell(0, 10, "Purchase Scenario Comparison Summary", ln=True)
+
+                    pdf.set_font("Arial", '', 10)
+                    col_width = pdf.w / (len(df.columns) + 1)
+                    pdf.ln(5)
+                    for col in df.columns:
+                        pdf.cell(col_width, 8, str(col), border=1)
+                    pdf.ln()
+                    for _, row in df.iterrows():
+                        for val in row:
+                            pdf.cell(col_width, 8, str(val), border=1)
+                        pdf.ln()
+
+                    # Add individual purchase summaries
+                    for idx, result in enumerate(buy_results):
+                        buy_params, summary, waterfall = result
+
+                        pdf.add_page()
+                        try:
+                            pdf.image("savills_logo.png", x=10, y=10, w=40)
+                        except Exception:
+                            pass
+                        pdf.ln(20)
+
+                        pdf.set_font("Arial", 'B', 14)
+                        pdf.cell(0, 10, f"Purchase Scenario {idx+1}: {summary['Option']}", ln=True)
+
+                        pdf.set_font("Arial", '', 11)
+                        for k, v in summary.items():
+                            pdf.cell(0, 8, f"{k}: {v}", ln=True)
+
+                    # Stream to download
+                    pdf_output = io.BytesIO()
+                    pdf.output(pdf_output)
+                    st.download_button("📥 Download Purchase PDF Summary", data=pdf_output.getvalue(),
+                                       file_name="Purchase_Summary.pdf", mime="application/pdf")
+            else:
+                st.info("No purchase data available for export.")
+    else:
+        # Original lease comparison
+        results = st.session_state.get("results", [])
+        if len(results) < 2:
+            st.info("Enable compare & run ≥2 scenarios.")
+        else:
+            # Build comparison DataFrame with Lease Type
+            df = pd.DataFrame([{
+                **r[1],  # summary
+                "Lease Type": r[0].get("lease_type", "")
+            } for r in results])
+
+            st.markdown("## Comparison Summary")
+            st.dataframe(df, use_container_width=True)
+
+            # Excel export
+            if not df.empty:
+                excel_buf = io.BytesIO()
+                with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
+                    df.to_excel(writer, sheet_name="Summary", index=False)
+                st.download_button("📥 Download Comparison Excel", excel_buf.getvalue(),
+                                   file_name="comparison.xlsx",
+                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+                # PDF export
+                if st.button("📄 Generate PDF Summary"):
+                    pdf = FPDF()
+                    pdf.set_auto_page_break(auto=True, margin=15)
+                    pdf.add_page()
+                    
+                    # Try to add logo to PDF using the asset path function
+                    try:
+                        logo_path = get_asset_path("savills_logo.png")
+                        pdf.image(logo_path, x=10, y=10, w=40)
+                    except Exception:
+                        # Continue without logo if not available
+                        pass
+                        
                     pdf.ln(20)  # space below the logo
 
-                    pdf.set_font("Arial", 'B', 14)
-                    pdf.cell(0, 10, f"Scenario {idx+1}: {s['Option']}", ln=True)
+                    pdf.set_font("Arial", 'B', 16)
+                    pdf.cell(0, 10, "Lease Scenario Comparison Summary", ln=True)
 
-                    pdf.set_font("Arial", '', 11)
-                    for k, v in s.items():
-                        pdf.cell(0, 8, f"{k}: {v}", ln=True)
+                    pdf.set_font("Arial", '', 10)
+                    col_width = pdf.w / (len(df.columns) + 1)
+                    pdf.ln(5)
+                    for col in df.columns:
+                        pdf.cell(col_width, 8, str(col), border=1)
+                    pdf.ln()
+                    for _, row in df.iterrows():
+                        for val in row:
+                            pdf.cell(col_width, 8, str(val), border=1)
+                        pdf.ln()
 
-                    import tempfile
-                    from PIL import Image
+                    # Add individual scenario summaries
+                    for idx, result in enumerate(results):
+                        p, s, wf = result
 
-                    # --- Create and save charts as images ---
+                        pdf.add_page()
+                        pdf.image("savills_logo.png", x=10, y=10, w=40)
+                        pdf.ln(20)  # space below the logo
 
-                    # Annual Cost Breakdown Chart
-                    cost_fig = go.Figure()
-                    for name in ["Base Rent", "Opex", "Parking Exp"]:
-                        if name in wf.columns:
-                            cost_fig.add_trace(go.Bar(name=name, x=wf["Year"], y=wf[name]))
-                    cost_fig.update_layout(
-                        barmode="stack",
-                        title="Annual Cost Breakdown",
-                        xaxis_title="Year",
-                        yaxis_title="Cost ($)",
-                        margin=dict(t=30, b=30),
-                        legend_title_text="Category"
-                    )
+                        pdf.set_font("Arial", 'B', 14)
+                        pdf.cell(0, 10, f"Scenario {idx+1}: {s['Option']}", ln=True)
 
-                    # Net CF Breakdown Chart
-                    netcf_fig = go.Figure()
-                    netcf_fig.add_trace(go.Bar(name="Rent Abatement", x=wf["Year"], y=wf["Rent Abatement"]))
-                    netcf_fig.add_trace(go.Bar(name="Net CF", x=wf["Year"], y=wf["Net CF"]))
-                    netcf_fig.update_layout(
-                        barmode="relative",
-                        title="Net Cash Flow",
-                        xaxis_title="Year",
-                        yaxis_title="Net Impact ($)",
-                        margin=dict(t=30, b=30),
-                        legend_title_text="Component"
-                    )
+                        pdf.set_font("Arial", '', 11)
+                        for k, v in s.items():
+                            pdf.cell(0, 8, f"{k}: {v}", ln=True)
+
+                        import tempfile
+                        from PIL import Image
+
+                        # --- Create and save charts as images ---
+
+                        # Annual Cost Breakdown Chart
+                        cost_fig = go.Figure()
+                        for name in ["Base Rent", "Opex", "Parking Exp"]:
+                            if name in wf.columns:
+                                cost_fig.add_trace(go.Bar(name=name, x=wf["Year"], y=wf[name]))
+                        cost_fig.update_layout(
+                            barmode="stack",
+                            title="Annual Cost Breakdown",
+                            xaxis_title="Year",
+                            yaxis_title="Cost ($)",
+                            margin=dict(t=30, b=30),
+                            legend_title_text="Category"
+                        )
+
+                        # Net CF Breakdown Chart
+                        netcf_fig = go.Figure()
+                        netcf_fig.add_trace(go.Bar(name="Rent Abatement", x=wf["Year"], y=wf["Rent Abatement"]))
+                        netcf_fig.add_trace(go.Bar(name="Net CF", x=wf["Year"], y=wf["Net CF"]))
+                        netcf_fig.update_layout(
+                            barmode="relative",
+                            title="Net Cash Flow",
+                            xaxis_title="Year",
+                            yaxis_title="Net Impact ($)",
+                            margin=dict(t=30, b=30),
+                            legend_title_text="Component"
+                        )
 
                     # Save both charts to temporary files
                     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as cost_tmp:
@@ -1343,5 +1953,59 @@ with tab_comparison:
                 pdf.output(pdf_output)
                 st.download_button("📥 Download PDF Summary", data=pdf_output.getvalue(),
                                    file_name="Lease_Summary.pdf", mime="application/pdf")
-        else:
-            st.info("No data available for export.")
+            else:
+                st.info("No data available for export.")
+
+# ---- Purchase vs. Lease Comparison Tab ----
+with tab_compare:
+    st.header("Purchase vs. Lease Comparison")
+    lease_results = st.session_state.get("results", [])
+    buy_results = st.session_state.get("buy_results", [])
+    
+    if lease_results and buy_results:
+        # Use the first scenario from each for comparison
+        lease_summary = lease_results[0][1]
+        lease_waterfall = lease_results[0][2]
+        buy_summary = buy_results[0][1]
+        buy_waterfall = buy_results[0][2]
+        
+        st.subheader("Summary Table")
+        summary_df = pd.DataFrame([
+            {"Type": "Lease", **lease_summary},
+            {"Type": "Purchase", **buy_summary}
+        ])
+        st.dataframe(summary_df, use_container_width=True)
+        
+        st.markdown("---")
+        st.subheader("Annual Cash Flow Comparison")
+        years = list(range(1, max(len(lease_waterfall), len(buy_waterfall)) + 1))
+        lease_cf = lease_waterfall["Net CF"].tolist() if "Net CF" in lease_waterfall else [0]*len(years)
+        buy_cf = [-float(row["Total Cost"].replace("$", "").replace(",", "")) for row in buy_waterfall.to_dict('records')]
+        # Pad shorter list
+        if len(lease_cf) < len(years):
+            lease_cf += [lease_cf[-1]] * (len(years) - len(lease_cf))
+        if len(buy_cf) < len(years):
+            buy_cf += [buy_cf[-1]] * (len(years) - len(buy_cf))
+        
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=years, y=lease_cf, mode='lines+markers', name='Lease', line=dict(color='blue')))
+        fig.add_trace(go.Scatter(x=years, y=buy_cf, mode='lines+markers', name='Purchase', line=dict(color='green')))
+        fig.update_layout(title="Annual Cash Flow Comparison", xaxis_title="Year", yaxis_title="Cash Flow ($)", template="plotly_white")
+        st.plotly_chart(fig, use_container_width=True)
+        
+        st.markdown("---")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("Lease Cash Flow Table")
+            st.dataframe(lease_waterfall, use_container_width=True)
+        with col2:
+            st.subheader("Purchase Cash Flow Table")
+            st.dataframe(buy_waterfall, use_container_width=True)
+        
+        st.markdown("---")
+        st.caption("This comparison uses the first scenario from each analysis. Run more scenarios and use the Comparison tabs for multi-scenario analysis.")
+    else:
+        st.info("To compare purchase and lease, run at least one analysis for each.\n\nGo to the Inputs tab for Lease and Buy Analyzer, configure your scenarios, and run the analysis. The comparison will appear here once both are available.")
+        st.caption("This feature lets you see a side-by-side comparison of your first lease and purchase scenarios, including cash flows and summary metrics.")
+
+
